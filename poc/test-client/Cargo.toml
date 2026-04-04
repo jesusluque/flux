@@ -1,10 +1,10 @@
 [package]
-name    = "server"
+name    = "test-client"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "flux-server"
+name = "flux-test-client"
 path = "src/main.rs"
 
 [dependencies]
@@ -16,7 +16,10 @@ flux-framing    = { path = "../flux-framing" }
 env_logger      = { workspace = true }
 log             = { workspace = true }
 ctrlc           = { workspace = true }
+serde_json      = { workspace = true }
 
-# Pull in our plugin libs so they are linked
-gst-fluxframer = { path = "../gst-fluxframer" }
-gst-fluxsink   = { path = "../gst-fluxsink" }
+# Pull in our plugin libs so they are linked + registered
+gst-fluxsrc      = { path = "../gst-fluxsrc" }
+gst-fluxdemux    = { path = "../gst-fluxdemux" }
+gst-fluxdeframer = { path = "../gst-fluxdeframer" }
+gst-fluxcdbc     = { path = "../gst-fluxcdbc" }

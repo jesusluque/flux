@@ -91,6 +91,10 @@ mod imp {
         byte_count: u64,
         bw_window_start: Instant,
 
+        // Cumulative stats (survive window resets)
+        reports_sent: u64,
+        lost_total: u64,
+
         // Socket for feedback datagrams
         sock: Option<UdpSocket>,
 
@@ -113,6 +117,8 @@ mod imp {
                 recv_count: 0,
                 byte_count: 0,
                 bw_window_start: Instant::now(),
+                reports_sent: 0,
+                lost_total: 0,
                 sock: None,
                 last_fb: CdbcFeedback::default(),
             }
@@ -174,6 +180,16 @@ mod imp {
                         .blurb("Measured receive bitrate in bits per second")
                         .read_only()
                         .build(),
+                    glib::ParamSpecUInt64::builder("reports-sent")
+                        .nick("Reports sent")
+                        .blurb("Total CDBC_FEEDBACK datagrams sent to the server")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt64::builder("datagrams-lost-total")
+                        .nick("Datagrams lost total")
+                        .blurb("Cumulative datagram loss count across all measurement windows")
+                        .read_only()
+                        .build(),
                 ]
             })
         }
@@ -199,6 +215,8 @@ mod imp {
                 "loss-pct" => m.last_fb.loss_pct.to_value(),
                 "jitter-ms" => m.last_fb.jitter_ms.to_value(),
                 "rx-bps" => m.last_fb.rx_bps.to_value(),
+                "reports-sent" => m.reports_sent.to_value(),
+                "datagrams-lost-total" => (m.lost_total + m.lost_count).to_value(),
                 _ => unimplemented!(),
             }
         }
@@ -369,6 +387,7 @@ mod imp {
 
                     let dst = format!("{}:{}", m.server_addr, m.server_port);
                     let _ = sock.send_to(&pkt, &dst);
+                    m.reports_sent += 1;
 
                     gst::debug!(
                         gst::CAT_DEFAULT,
@@ -381,6 +400,7 @@ mod imp {
                 }
 
                 m.last_send = now;
+                m.lost_total += m.lost_count;
                 m.byte_count = 0;
                 m.recv_count = 0;
                 m.lost_count = 0;

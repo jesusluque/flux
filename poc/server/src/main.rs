@@ -50,6 +50,16 @@ fn main() {
         "[flux-server] Pipeline started — encoding H.265 and sending FLUX datagrams on :7400"
     );
 
+    // Install Ctrl-C handler: send EOS so the pipeline shuts down cleanly.
+    let pipeline_weak = pipeline.downgrade();
+    ctrlc::set_handler(move || {
+        eprintln!("[flux-server] Ctrl-C — sending EOS");
+        if let Some(p) = pipeline_weak.upgrade() {
+            p.send_event(gst::event::Eos::new());
+        }
+    })
+    .expect("ctrlc handler");
+
     let bus = pipeline.bus().unwrap();
     for msg in bus.iter_timed(gst::ClockTime::NONE) {
         use gst::MessageView;

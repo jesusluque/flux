@@ -52,7 +52,7 @@ mod imp {
     use gst_base::subclass::prelude::*;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, UdpSocket};
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -61,10 +61,14 @@ mod imp {
         port: u16,
         udp_sock: Option<Arc<UdpSocket>>,
         client_addr: Arc<Mutex<Option<SocketAddr>>>,
-        /// Shared BW Governor; written by the CDBC reader thread.
+        /// Last accepted session_id (set by the control listener thread).
+        session_id_last: Arc<Mutex<String>>,
+        /// BW Governor; written by the CDBC reader thread.
         bw_gov: Arc<Mutex<BwGovernor>>,
-        /// Monotonically increasing probe sequence number.
+        /// Monotonically increasing probe sequence number (also = probes sent).
         probe_seq: Arc<AtomicU32>,
+        /// Number of CDBC_FEEDBACK datagrams received from the client.
+        cdbc_reports_received: Arc<AtomicU64>,
     }
 
     impl Default for Inner {
@@ -74,8 +78,10 @@ mod imp {
                 port: DEFAULT_PORT,
                 udp_sock: None,
                 client_addr: Arc::new(Mutex::new(None)),
+                session_id_last: Arc::new(Mutex::new(String::new())),
                 bw_gov: Arc::new(Mutex::new(BwGovernor::new())),
-                probe_seq: Arc::new(AtomicU32::new(1)),
+                probe_seq: Arc::new(AtomicU32::new(0)),
+                cdbc_reports_received: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -107,6 +113,26 @@ mod imp {
                         .blurb("FLUX media UDP port")
                         .default_value(DEFAULT_PORT as u32)
                         .build(),
+                    glib::ParamSpecString::builder("session-id-last")
+                        .nick("Last session ID")
+                        .blurb("Session ID from the most recently accepted SESSION_REQUEST")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt64::builder("cdbc-reports-received")
+                        .nick("CDBC reports received")
+                        .blurb("Number of CDBC_FEEDBACK datagrams received from the client")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt::builder("bw-probes-sent")
+                        .nick("BW probes sent")
+                        .blurb("Number of BANDWIDTH_PROBE datagrams sent to the client")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecString::builder("bw-governor-state")
+                        .nick("BW Governor state")
+                        .blurb("Current BW Governor state (Probe/Stable/RampUp/RampDown/Emergency)")
+                        .read_only()
+                        .build(),
                 ]
             })
         }
@@ -125,6 +151,12 @@ mod imp {
             match pspec.name() {
                 "bind-address" => s.bind_addr.to_value(),
                 "port" => (s.port as u32).to_value(),
+                "session-id-last" => s.session_id_last.lock().unwrap().clone().to_value(),
+                "cdbc-reports-received" => {
+                    s.cdbc_reports_received.load(Ordering::Relaxed).to_value()
+                }
+                "bw-probes-sent" => s.probe_seq.load(Ordering::Relaxed).to_value(),
+                "bw-governor-state" => format!("{:?}", s.bw_gov.lock().unwrap().state).to_value(),
                 _ => unimplemented!(),
             }
         }
@@ -174,8 +206,9 @@ mod imp {
             // Spawn TCP control thread for SESSION handshake
             let ctrl_addr = format!("{}:{}", s.bind_addr, s.port + 1);
             let client_ref = s.client_addr.clone();
+            let sid_ref = s.session_id_last.clone();
             thread::spawn(move || {
-                run_control_listener(&ctrl_addr, client_ref);
+                run_control_listener(&ctrl_addr, client_ref, sid_ref);
             });
 
             // Spawn CDBC feedback reader thread (reads from the same UDP socket)
@@ -183,8 +216,15 @@ mod imp {
             let bw_ref = s.bw_gov.clone();
             let probe_seq_ref = s.probe_seq.clone();
             let client_addr_ref = s.client_addr.clone();
+            let cdbc_rx_ref = s.cdbc_reports_received.clone();
             thread::spawn(move || {
-                run_cdbc_reader(cdbc_sock, bw_ref, probe_seq_ref, client_addr_ref);
+                run_cdbc_reader(
+                    cdbc_sock,
+                    bw_ref,
+                    probe_seq_ref,
+                    client_addr_ref,
+                    cdbc_rx_ref,
+                );
             });
 
             eprintln!(
@@ -249,6 +289,7 @@ mod imp {
         bw_gov: Arc<Mutex<BwGovernor>>,
         probe_seq: Arc<AtomicU32>,
         client_addr: Arc<Mutex<Option<SocketAddr>>>,
+        cdbc_reports_received: Arc<AtomicU64>,
     ) {
         // Allow the socket to be shared: clone a reference for reading.
         // The socket is blocking; recv_from will wait for the next datagram.
@@ -296,6 +337,8 @@ mod imp {
                 fb.jitter_ms,
                 fb.probe_result_bps,
             );
+
+            cdbc_reports_received.fetch_add(1, Ordering::Relaxed);
 
             // Run the BW Governor state machine
             let action = {
@@ -378,7 +421,11 @@ mod imp {
         }
     }
 
-    fn run_control_listener(addr: &str, client_store: Arc<Mutex<Option<SocketAddr>>>) {
+    fn run_control_listener(
+        addr: &str,
+        client_store: Arc<Mutex<Option<SocketAddr>>>,
+        session_id_store: Arc<Mutex<String>>,
+    ) {
         /// Monotonically increasing session counter, shared across all connections.
         static SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
 
@@ -448,6 +495,7 @@ mod imp {
             let media_addr: SocketAddr =
                 format!("{}:{}", peer.ip(), req.media_port).parse().unwrap();
             *client_store.lock().unwrap() = Some(media_addr);
+            *session_id_store.lock().unwrap() = session_id.clone();
 
             eprintln!(
                 "[fluxsink] SESSION_ACCEPT sent — session_id={} client media addr={}",

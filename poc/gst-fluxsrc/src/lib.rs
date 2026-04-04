@@ -85,6 +85,7 @@ mod imp {
         server_udp: Option<SocketAddr>,
         session_id: String,
         keepalive_seq: u32,
+        keepalives_sent: u64,
         last_ka_sent: Instant,
         ka_interval: Duration,
         /// Number of consecutive missed server keepalives before session is dead.
@@ -106,6 +107,7 @@ mod imp {
                 server_udp: None,
                 session_id: String::new(),
                 keepalive_seq: 0,
+                keepalives_sent: 0,
                 last_ka_sent: Instant::now(),
                 ka_interval: Duration::from_millis(1000),
                 ka_timeout_count: 0, // disabled until SESSION_ACCEPT received
@@ -152,6 +154,27 @@ mod imp {
                         .blurb("FLUX server media port (default 7400)")
                         .default_value(DEFAULT_PORT as u32)
                         .build(),
+                    // ── Read-only session stats ───────────────────────────────
+                    glib::ParamSpecString::builder("session-id")
+                        .nick("Session ID")
+                        .blurb("Negotiated session ID (set after SESSION_ACCEPT)")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt::builder("keepalive-interval-ms")
+                        .nick("KA interval ms")
+                        .blurb("Keepalive interval negotiated in SESSION_ACCEPT (ms)")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt::builder("keepalive-timeout-count")
+                        .nick("KA timeout count")
+                        .blurb("Number of missed keepalives before session is declared dead")
+                        .read_only()
+                        .build(),
+                    glib::ParamSpecUInt64::builder("keepalives-sent")
+                        .nick("Keepalives sent")
+                        .blurb("Total KEEPALIVE datagrams sent to the server")
+                        .read_only()
+                        .build(),
                 ]
             })
         }
@@ -170,6 +193,10 @@ mod imp {
             match pspec.name() {
                 "address" => s.server_addr.to_value(),
                 "port" => (s.port as u32).to_value(),
+                "session-id" => s.session_id.to_value(),
+                "keepalive-interval-ms" => (s.ka_interval.as_millis() as u32).to_value(),
+                "keepalive-timeout-count" => s.ka_timeout_count.to_value(),
+                "keepalives-sent" => s.keepalives_sent.to_value(),
                 _ => unimplemented!(),
             }
         }
@@ -357,6 +384,7 @@ mod imp {
                             pkt.extend_from_slice(&ka_json);
                             let _ = sock.send_to(&pkt, dst);
                             s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
+                            s.keepalives_sent += 1;
                             s.last_ka_sent = Instant::now();
                         }
                     }
