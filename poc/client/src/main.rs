@@ -16,12 +16,15 @@
 //!
 //!   Space     — pause / resume (PAUSED ↔ PLAYING)
 //!   Q / q     — quit cleanly
-//!   S / s     — print live session stats
+//!   S / s     — print live session stats (includes NetSim state)
 //!   P / p     — send a FLUX-C PTZ preset to the server (ch 0, pan=0°, tilt=0°)
 //!   A / a     — toggle audio mute on channel 0 via FLUX-C audio_mix command
 //!   R / r     — send a FLUX-C routing info request
 //!   D / d     — toggle fps overlay on video window
 //!   T / t     — cycle videotestsrc pattern on server via FLUX-C test_pattern
+//!   L / l     — NetSim loss: L = +5%, l = -5% (clamped 0–100%)
+//!   Y / y     — NetSim delay: Y = +20 ms, y = -20 ms (clamped 0–500 ms)
+//!   B / b     — NetSim bandwidth: B = +1000 kbps, b = -1000 kbps (0 = off)
 //!   H / ? / h — show this help
 //!
 //! All FLUX-C commands are sent as MetadataFrame (0xC) datagrams over UDP to the
@@ -383,6 +386,47 @@ fn run(tty: Option<Tty>) {
                             eprintln!("[flux-client] FLUX-C test_pattern → {}", pat_id);
                         }
                     }
+                    // ── NetSim hotkeys ────────────────────────────────────────
+                    b'L' => {
+                        let cur: f64 = fluxsrc_ctl.property("sim-loss-pct");
+                        let new = (cur + 5.0).min(100.0);
+                        fluxsrc_ctl.set_property("sim-loss-pct", new);
+                        eprintln!("[flux-client] NetSim loss → {:.1}%", new);
+                    }
+                    b'l' => {
+                        let cur: f64 = fluxsrc_ctl.property("sim-loss-pct");
+                        let new = (cur - 5.0).max(0.0);
+                        fluxsrc_ctl.set_property("sim-loss-pct", new);
+                        eprintln!("[flux-client] NetSim loss → {:.1}%", new);
+                    }
+                    b'Y' => {
+                        let cur: u32 = fluxsrc_ctl.property("sim-delay-ms");
+                        let new = (cur + 20).min(500);
+                        fluxsrc_ctl.set_property("sim-delay-ms", new);
+                        eprintln!("[flux-client] NetSim delay → {} ms", new);
+                    }
+                    b'y' => {
+                        let cur: u32 = fluxsrc_ctl.property("sim-delay-ms");
+                        let new = cur.saturating_sub(20);
+                        fluxsrc_ctl.set_property("sim-delay-ms", new);
+                        eprintln!("[flux-client] NetSim delay → {} ms", new);
+                    }
+                    b'B' => {
+                        let cur: u32 = fluxsrc_ctl.property("sim-bw-kbps");
+                        let new = cur + 1000;
+                        fluxsrc_ctl.set_property("sim-bw-kbps", new);
+                        eprintln!("[flux-client] NetSim bw → {} kbps", new);
+                    }
+                    b'b' => {
+                        let cur: u32 = fluxsrc_ctl.property("sim-bw-kbps");
+                        let new = cur.saturating_sub(1000);
+                        fluxsrc_ctl.set_property("sim-bw-kbps", new);
+                        if new == 0 {
+                            eprintln!("[flux-client] NetSim bw → OFF (unlimited)");
+                        } else {
+                            eprintln!("[flux-client] NetSim bw → {} kbps", new);
+                        }
+                    }
                     b'h' | b'H' | b'?' => print_help(),
                     _ => {}
                 }
@@ -404,7 +448,7 @@ fn print_help() {
     eprintln!("[flux-client] Controls:");
     eprintln!("  Space — pause / resume");
     eprintln!("  Q     — quit");
-    eprintln!("  S     — print live stats");
+    eprintln!("  S     — print live stats (includes NetSim state)");
     eprintln!("  P     — send FLUX-C PTZ preset (ch 0)");
     eprintln!("  A     — toggle audio mute ch 0 via FLUX-C");
     eprintln!("  R     — show routing / session info");
@@ -412,6 +456,9 @@ fn print_help() {
     eprintln!(
         "  T     — cycle server test pattern via FLUX-C (smpte→snow→black→circular→smpte75→ball→colors)"
     );
+    eprintln!("  L/l   — NetSim packet loss  +5% / -5%  (clamped 0–100%)");
+    eprintln!("  Y/y   — NetSim delay       +20ms / -20ms  (clamped 0–500 ms)");
+    eprintln!("  B/b   — NetSim bandwidth +1000 / -1000 kbps  (0 = off)");
     eprintln!("  H / ? — show this help");
     eprintln!();
 }
@@ -426,6 +473,10 @@ fn print_stats(fluxsrc: &gst::Element, fluxcdbc: &gst::Element) {
     let loss_pct: f64 = fluxcdbc.property("loss-pct");
     let jitter_ms: f64 = fluxcdbc.property("jitter-ms");
     let rx_bps: u64 = fluxcdbc.property("rx-bps");
+    // NetSim state
+    let sim_loss: f64 = fluxsrc.property("sim-loss-pct");
+    let sim_delay: u32 = fluxsrc.property("sim-delay-ms");
+    let sim_bw: u32 = fluxsrc.property("sim-bw-kbps");
     eprintln!();
     eprintln!("[flux-client] ── Live Stats ──────────────────────────────");
     eprintln!(
@@ -452,6 +503,14 @@ fn print_stats(fluxsrc: &gst::Element, fluxcdbc: &gst::Element) {
         rx_bps,
         rx_bps as f64 / 1_000_000.0
     );
+    eprintln!("[flux-client] ── NetSim ──────────────────────────────────");
+    eprintln!("  Loss                : {:.1}%", sim_loss);
+    eprintln!("  Delay               : {} ms", sim_delay);
+    if sim_bw == 0 {
+        eprintln!("  Bandwidth cap       : OFF (unlimited)");
+    } else {
+        eprintln!("  Bandwidth cap       : {} kbps", sim_bw);
+    }
     eprintln!("[flux-client] ─────────────────────────────────────────────");
     eprintln!();
 }
