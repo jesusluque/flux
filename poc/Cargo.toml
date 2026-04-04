@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = [
+    "flux-framing",
+    "gst-fluxframer",
+    "gst-fluxdeframer",
+    "gst-fluxsink",
+    "gst-fluxsrc",
+    "gst-fluxdemux",
+    "gst-fluxcdbc",
+    "server",
+    "client",
+]
+
+[workspace.dependencies]
+gstreamer       = { version = "0.22", features = ["v1_22"] }
+gstreamer-base  = "0.22"
+gstreamer-video = "0.22"
+gstreamer-audio = "0.22"
+gstreamer-app   = "0.22"
+
+tokio      = { version = "1", features = ["full"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes      = "1"
+log        = "0.4"
+env_logger = "0.11"
+
+flux-framing = { path = "../flux-framing" }

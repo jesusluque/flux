@@ -1,0 +1,15 @@
+[package]
+name    = "gst-fluxdeframer"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name       = "gstfluxdeframer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-video = { workspace = true }
+flux-framing    = { path = "../flux-framing" }
+log             = { workspace = true }

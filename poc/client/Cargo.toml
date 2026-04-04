@@ -1,0 +1,23 @@
+[package]
+name    = "client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flux-client"
+path = "src/main.rs"
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-app   = { workspace = true }
+flux-framing    = { path = "../flux-framing" }
+env_logger      = { workspace = true }
+log             = { workspace = true }
+
+# Plugin libs statically linked
+gst-fluxsrc      = { path = "../gst-fluxsrc" }
+gst-fluxdemux    = { path = "../gst-fluxdemux" }
+gst-fluxdeframer = { path = "../gst-fluxdeframer" }
+gst-fluxcdbc     = { path = "../gst-fluxcdbc" }

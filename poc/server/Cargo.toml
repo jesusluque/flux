@@ -1,0 +1,21 @@
+[package]
+name    = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flux-server"
+path = "src/main.rs"
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-video = { workspace = true }
+gstreamer-app   = { workspace = true }
+flux-framing    = { path = "../flux-framing" }
+env_logger      = { workspace = true }
+log             = { workspace = true }
+
+# Pull in our plugin libs so they are linked
+gst-fluxframer = { path = "../gst-fluxframer" }
+gst-fluxsink   = { path = "../gst-fluxsink" }
