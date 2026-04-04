@@ -40,13 +40,23 @@ impl FluxSink {
             Self::static_type(),
         )
     }
+
+    /// Register a sync channel to receive FLUX-C `MetadataFrame` datagrams.
+    /// Must be called before setting the pipeline to PLAYING.
+    /// Returns the receiver end; the sender is stored inside the element.
+    pub fn subscribe_flux_control(&self) -> std::sync::mpsc::Receiver<flux_framing::FluxControl> {
+        use gstreamer::subclass::prelude::ObjectSubclassExt;
+        let (tx, rx) = std::sync::mpsc::sync_channel(32);
+        imp::FluxSink::from_obj(self).set_flux_control_tx(tx);
+        rx
+    }
 }
 
 mod imp {
     use super::*;
     use flux_framing::{
-        now_ns, BandwidthProbe, BwAction, BwGovernor, CdbcFeedback, FluxHeader, FrameType,
-        SessionAccept, SessionRequest, DEFAULT_PORT, HEADER_SIZE,
+        now_ns, BandwidthProbe, BwAction, BwGovernor, CdbcFeedback, FluxControl, FluxHeader,
+        FrameType, SessionAccept, SessionRequest, DEFAULT_PORT, HEADER_SIZE,
     };
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
@@ -69,6 +79,9 @@ mod imp {
         probe_seq: Arc<AtomicU32>,
         /// Number of CDBC_FEEDBACK datagrams received from the client.
         cdbc_reports_received: Arc<AtomicU64>,
+        /// Sender half of the FLUX-C control channel. The CDBC reader thread
+        /// forwards any MetadataFrame it receives here so the server can act on it.
+        flux_control_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<FluxControl>>>>,
     }
 
     impl Default for Inner {
@@ -82,6 +95,7 @@ mod imp {
                 bw_gov: Arc::new(Mutex::new(BwGovernor::new())),
                 probe_seq: Arc::new(AtomicU32::new(0)),
                 cdbc_reports_received: Arc::new(AtomicU64::new(0)),
+                flux_control_tx: Arc::new(Mutex::new(None)),
             }
         }
     }
@@ -89,6 +103,15 @@ mod imp {
     #[derive(Default)]
     pub struct FluxSink {
         inner: Mutex<Inner>,
+    }
+
+    impl FluxSink {
+        pub(super) fn set_flux_control_tx(
+            &self,
+            tx: std::sync::mpsc::SyncSender<flux_framing::FluxControl>,
+        ) {
+            *self.inner.lock().unwrap().flux_control_tx.lock().unwrap() = Some(tx);
+        }
     }
 
     #[glib::object_subclass]
@@ -217,6 +240,7 @@ mod imp {
             let probe_seq_ref = s.probe_seq.clone();
             let client_addr_ref = s.client_addr.clone();
             let cdbc_rx_ref = s.cdbc_reports_received.clone();
+            let flux_ctrl_tx = s.flux_control_tx.clone();
             thread::spawn(move || {
                 run_cdbc_reader(
                     cdbc_sock,
@@ -224,6 +248,7 @@ mod imp {
                     probe_seq_ref,
                     client_addr_ref,
                     cdbc_rx_ref,
+                    flux_ctrl_tx,
                 );
             });
 
@@ -284,12 +309,14 @@ mod imp {
 
     /// Reads incoming UDP datagrams on the media port, dispatches CDBC_FEEDBACK
     /// frames to the BW Governor, and sends BANDWIDTH_PROBE when requested.
+    /// Also forwards MetadataFrame (FLUX-C) datagrams to the flux_control channel.
     fn run_cdbc_reader(
         sock: Arc<UdpSocket>,
         bw_gov: Arc<Mutex<BwGovernor>>,
         probe_seq: Arc<AtomicU32>,
         client_addr: Arc<Mutex<Option<SocketAddr>>>,
         cdbc_reports_received: Arc<AtomicU64>,
+        flux_control_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<FluxControl>>>>,
     ) {
         // Allow the socket to be shared: clone a reference for reading.
         // The socket is blocking; recv_from will wait for the next datagram.
@@ -312,6 +339,26 @@ mod imp {
                 Some(h) => h,
                 None => continue,
             };
+
+            if hdr.frame_type == FrameType::MetadataFrame {
+                // FLUX-C control datagram — parse and forward to the server.
+                let body = &data[HEADER_SIZE..];
+                match FluxControl::decode_body(body) {
+                    Some(ctrl) => {
+                        eprintln!(
+                            "[fluxsink/ctrl] FLUX-C {:?} from {}",
+                            ctrl.control_type, from
+                        );
+                        if let Some(tx) = flux_control_tx.lock().unwrap().as_ref() {
+                            let _ = tx.try_send(ctrl);
+                        }
+                    }
+                    None => {
+                        eprintln!("[fluxsink/ctrl] unreadable MetadataFrame from {}", from);
+                    }
+                }
+                continue;
+            }
 
             if hdr.frame_type != FrameType::CdbcFeedbackT {
                 // Not a CDBC frame — ignore (media data also arrives here from

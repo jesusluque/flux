@@ -202,7 +202,11 @@ fn run() {
                 eprintln!("[flux-test-client] cdbc (server echo) → fakesink linked");
             }
             _ => {
-                eprintln!("[flux-test-client] unhandled pad '{}' — ignoring", pad_name);
+                // misc, control etc. — fluxdemux already handles not-linked gracefully.
+                eprintln!(
+                    "[flux-test-client] pad '{}' — unlinked (not-linked is non-fatal)",
+                    pad_name
+                );
             }
         }
     });

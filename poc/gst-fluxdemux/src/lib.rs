@@ -302,17 +302,23 @@ mod imp {
             };
 
             if let Some(pad) = src_pad {
-                pad.push(buf).map_err(|e| {
-                    if e != FlowError::Flushing {
+                match pad.push(buf) {
+                    Ok(_) => {}
+                    // not-linked means nothing is consuming this pad right now —
+                    // that is normal for misc/control pads that have no downstream
+                    // element. Continue processing other buffers.
+                    Err(FlowError::NotLinked) => {}
+                    Err(FlowError::Flushing) => {}
+                    Err(e) => {
                         gst::warning!(
                             gst::CAT_DEFAULT,
                             "FluxDemux: push on '{}' returned {:?}",
                             pad_name,
                             e
                         );
+                        return Err(e);
                     }
-                    e
-                })?;
+                }
             }
 
             Ok(gst::FlowSuccess::Ok)

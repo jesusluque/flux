@@ -9,7 +9,7 @@
 //!                     → video/x-h265,stream-format=hvc1,alignment=au
 //!                     → vtdec_hw
 //!                     → videoconvertscale
-//!                     → osxvideosink
+//!                     → fpsdisplaysink (wraps osxvideosink)
 //!         cdbc    → fakesink  (server→client CDBC echo — not used in PoC)
 //!
 //! ── Keyboard controls (stdin) ─────────────────────────────────────────────────
@@ -19,8 +19,10 @@
 //!   S / s     — print live session stats
 //!   P / p     — send a FLUX-C PTZ preset to the server (ch 0, pan=0°, tilt=0°)
 //!   A / a     — toggle audio mute on channel 0 via FLUX-C audio_mix command
-//!   R / r     — send a FLUX-C routing info request (prints current session only;
-//!               routing redirect itself would require a target known at runtime)
+//!   R / r     — send a FLUX-C routing info request
+//!   D / d     — toggle fps overlay on video window
+//!   T / t     — cycle videotestsrc pattern on server via FLUX-C test_pattern
+//!   H / ? / h — show this help
 //!
 //! All FLUX-C commands are sent as MetadataFrame (0xC) datagrams over UDP to the
 //! server media port (spec §12 / §14).  The server logs receipt.
@@ -30,26 +32,29 @@ use gst::glib;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 fn main() {
     env_logger::init();
 
-    // Suppress GStreamer debug spam unless the caller has already set GST_DEBUG.
-    // Level 2 = WARNING: serious but non-fatal issues only.
     if std::env::var("GST_DEBUG").is_err() {
         std::env::set_var("GST_DEBUG", "2");
     }
 
     gst::init().expect("GStreamer init failed");
 
-    // On macOS, GStreamer video sinks require NSApplication to be running on
-    // the main thread.  gst::macos_main() sets this up.
-    gst::macos_main(run);
+    // Open /dev/tty and put it in raw mode NOW — before gst::macos_main()
+    // calls [NSApp run] which makes the process a foreground Cocoa app and
+    // may change how the OS delivers TTY input.
+    let tty = open_tty_raw();
+
+    // gst::macos_main() spawns our run() on a background thread and blocks
+    // the main thread in [NSApp run] forever (required for osxvideosink).
+    gst::macos_main(move || run(tty));
 }
 
-fn run() {
+fn run(tty: Option<Tty>) {
     // Register custom elements
     gstfluxsrc::plugin_register_static().expect("fluxsrc register");
     gstfluxdemux::plugin_register_static().expect("fluxdemux register");
@@ -86,11 +91,18 @@ fn run() {
         .build()
         .expect("videoconvertscale element");
 
-    let sink = gst::ElementFactory::make("osxvideosink")
+    let osxvideosink = gst::ElementFactory::make("osxvideosink")
         .property("sync", false)
         .property("async", false)
         .build()
         .expect("osxvideosink element");
+
+    let sink = gst::ElementFactory::make("fpsdisplaysink")
+        .property("video-sink", &osxvideosink)
+        .property("sync", false)
+        .property("text-overlay", true)
+        .build()
+        .expect("fpsdisplaysink element");
 
     let fluxcdbc = gst::ElementFactory::make("fluxcdbc")
         .property("server-address", "127.0.0.1")
@@ -175,7 +187,11 @@ fn run() {
                 eprintln!("[flux-client] cdbc (server echo) → fakesink linked");
             }
             _ => {
-                eprintln!("[flux-client] unhandled pad '{}' — ignoring", pad_name);
+                // misc, control etc. — fluxdemux handles not-linked gracefully.
+                eprintln!(
+                    "[flux-client] pad '{}' — unlinked (not-linked is non-fatal)",
+                    pad_name
+                );
             }
         }
     });
@@ -228,124 +244,147 @@ fn run() {
 
     // ── Keyboard input thread ────────────────────────────────────────────────
     //
-    // glib::unix_fd_add is unreliable for stdin on macOS when gst::macos_main
-    // owns the main thread (Cocoa run loop). Instead: a dedicated thread does
-    // a plain blocking read() — which always works for TTY stdin — and
-    // dispatches each keypress back onto the GLib main context via invoke(),
-    // so all GStreamer API calls happen on the correct thread.
-
-    // Put terminal into raw mode (single-keypress, no echo).
-    let old_termios = set_raw_mode();
-    let old_termios_cell = Arc::new(Mutex::new(old_termios));
+    // Two problems on macOS we work around here:
+    //
+    // 1. osxvideosink opens a Cocoa window that grabs keyboard focus.  While
+    //    that window is focused, keypresses never arrive on stdin (fd 0).
+    //    Fix: open /dev/tty — the controlling terminal — which always receives
+    //    TTY input regardless of Cocoa focus.
+    //
+    // 2. ctx.invoke() posts a GLib idle source that may never fire on macOS
+    //    because the Cocoa run loop — not GLib — drives the main thread.
+    //    Fix: call GStreamer APIs directly from the keyboard thread.
+    //    gst::Element::set_property, set_state, and glib::MainLoop::quit are
+    //    all internally thread-safe and need no main-thread dispatch.
 
     let audio_muted = Arc::new(AtomicBool::new(false));
     let ctrl_seq = Arc::new(Mutex::new(0u32));
+    // Cycle through a curated list of videotestsrc pattern ids.
+    // 0=smpte 1=snow 2=black 11=circular 13=smpte75 18=ball 24=colors
+    // Start at 1 so the first T press immediately moves off the server's
+    // default pattern (smpte=0) to something visibly different.
+    const PATTERNS: &[u32] = &[0, 1, 2, 11, 13, 18, 24];
+    let pattern_idx = Arc::new(AtomicU32::new(1));
+    let fps_overlay_on = Arc::new(AtomicBool::new(true));
 
     {
         let pipeline_ctl = pipeline.clone();
         let fluxsrc_ctl = fluxsrc.clone();
         let fluxcdbc_ctl = fluxcdbc.clone();
         let main_loop_ctl = main_loop.clone();
-        let termios_ctl = old_termios_cell.clone();
         let audio_muted = audio_muted.clone();
         let ctrl_seq = ctrl_seq.clone();
-        // Use the context that main_loop.run() actually pumps, not the thread default.
-        let ctx = main_loop.context();
+        let pattern_idx = pattern_idx.clone();
+        let fps_overlay_on = fps_overlay_on.clone();
+        let sink_ctl = sink.clone();
+
+        #[cfg(unix)]
+        let tty_fd = tty.as_ref().map(|t| t.fd).unwrap_or(-1);
+        #[cfg(not(unix))]
+        let tty_fd = -1i32;
 
         std::thread::spawn(move || {
-            use std::io::Read;
+            if tty_fd < 0 {
+                eprintln!("[flux-client] /dev/tty unavailable — hotkeys disabled");
+                return;
+            }
             let mut buf = [0u8; 1];
             loop {
-                if std::io::stdin().lock().read(&mut buf).is_err() {
+                let n = unsafe { libc::read(tty_fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+                if n <= 0 {
                     break;
                 }
                 let key = buf[0];
 
-                // Clone handles for the closure sent to the main context
-                let pipeline2 = pipeline_ctl.clone();
-                let fluxsrc2 = fluxsrc_ctl.clone();
-                let fluxcdbc2 = fluxcdbc_ctl.clone();
-                let main_loop2 = main_loop_ctl.clone();
-                let termios2 = termios_ctl.clone();
-                let muted2 = audio_muted.clone();
-                let seq2 = ctrl_seq.clone();
+                // All GStreamer calls below are thread-safe — no main-context
+                // dispatch needed.
+                let session_id: String = fluxsrc_ctl.property("session-id");
 
-                ctx.invoke(move || {
-                    let session_id: String = fluxsrc2.property("session-id");
-
-                    match key {
-                        b' ' => {
-                            let (_, cur, _) = pipeline2.state(gst::ClockTime::NONE);
-                            if cur == gst::State::Playing {
-                                pipeline2.set_state(gst::State::Paused).ok();
-                                eprintln!("[flux-client] PAUSED");
-                            } else {
-                                pipeline2.set_state(gst::State::Playing).ok();
-                                eprintln!("[flux-client] PLAYING");
-                            }
+                match key {
+                    b' ' => {
+                        // Use a short finite timeout — NONE blocks forever on macOS
+                        // because the state query is serviced by the GLib main loop
+                        // which is on the same thread as run() (macos-gst-thread),
+                        // causing a deadlock when called from the keyboard thread.
+                        let (_, cur, _) = pipeline_ctl.state(gst::ClockTime::from_mseconds(100));
+                        if cur == gst::State::Playing {
+                            pipeline_ctl.set_state(gst::State::Paused).ok();
+                            eprintln!("[flux-client] PAUSED");
+                        } else {
+                            pipeline_ctl.set_state(gst::State::Playing).ok();
+                            eprintln!("[flux-client] PLAYING");
                         }
-                        b'q' | b'Q' | 0x03 => {
-                            eprintln!("[flux-client] Quit");
-                            restore_termios(*termios2.lock().unwrap());
-                            main_loop2.quit();
-                        }
-                        b's' | b'S' => print_stats(&fluxsrc2, &fluxcdbc2),
-                        b'p' | b'P' => {
-                            send_flux_c(
-                                flux_framing::FluxControl::ptz(
-                                    &session_id,
-                                    0,
-                                    0.0,
-                                    0.0,
-                                    0.5,
-                                    0.5,
-                                    1.0,
-                                ),
-                                &seq2,
-                            );
-                            eprintln!("[flux-client] FLUX-C PTZ sent");
-                        }
-                        b'a' | b'A' => {
-                            let muted = !muted2.load(Ordering::Relaxed);
-                            muted2.store(muted, Ordering::Relaxed);
-                            let gain = if muted { -96.0f64 } else { 0.0f64 };
-                            send_flux_c(
-                                flux_framing::FluxControl::audio_mix(
-                                    &session_id,
-                                    vec![muted],
-                                    vec![gain],
-                                ),
-                                &seq2,
-                            );
-                            eprintln!(
-                                "[flux-client] audio ch0 -> {}",
-                                if muted { "MUTED" } else { "UNMUTED" }
-                            );
-                        }
-                        b'r' | b'R' => {
-                            eprintln!(
-                                "[flux-client] routing session={} server=127.0.0.1:7400",
-                                if session_id.is_empty() {
-                                    "<pending>"
-                                } else {
-                                    &session_id
-                                }
-                            );
-                            if !session_id.is_empty() {
-                                send_flux_c(
-                                    flux_framing::FluxControl::routing(&session_id, "current"),
-                                    &seq2,
-                                );
-                            }
-                        }
-                        b'h' | b'H' | b'?' => print_help(),
-                        _ => {}
                     }
-                });
-
-                // Exit thread when Q/Ctrl-C pressed (main loop will quit via invoke above)
-                if matches!(key, b'q' | b'Q' | 0x03) {
-                    break;
+                    b'q' | b'Q' | 0x03 => {
+                        eprintln!("[flux-client] Quit");
+                        main_loop_ctl.quit();
+                        break;
+                    }
+                    b's' | b'S' => print_stats(&fluxsrc_ctl, &fluxcdbc_ctl),
+                    b'p' | b'P' => {
+                        send_flux_c(
+                            flux_framing::FluxControl::ptz(&session_id, 0, 0.0, 0.0, 0.5, 0.5, 1.0),
+                            &ctrl_seq,
+                        );
+                        eprintln!("[flux-client] FLUX-C PTZ sent");
+                    }
+                    b'a' | b'A' => {
+                        let muted = !audio_muted.load(Ordering::Relaxed);
+                        audio_muted.store(muted, Ordering::Relaxed);
+                        let gain = if muted { -96.0f64 } else { 0.0f64 };
+                        send_flux_c(
+                            flux_framing::FluxControl::audio_mix(
+                                &session_id,
+                                vec![muted],
+                                vec![gain],
+                            ),
+                            &ctrl_seq,
+                        );
+                        eprintln!(
+                            "[flux-client] audio ch0 -> {}",
+                            if muted { "MUTED" } else { "UNMUTED" }
+                        );
+                    }
+                    b'r' | b'R' => {
+                        eprintln!(
+                            "[flux-client] routing session={} server=127.0.0.1:7400",
+                            if session_id.is_empty() {
+                                "<pending>"
+                            } else {
+                                &session_id
+                            }
+                        );
+                        if !session_id.is_empty() {
+                            send_flux_c(
+                                flux_framing::FluxControl::routing(&session_id, "current"),
+                                &ctrl_seq,
+                            );
+                        }
+                    }
+                    b'd' | b'D' => {
+                        let on = !fps_overlay_on.load(Ordering::Relaxed);
+                        fps_overlay_on.store(on, Ordering::Relaxed);
+                        sink_ctl.set_property("text-overlay", on);
+                        eprintln!(
+                            "[flux-client] fps overlay {}",
+                            if on { "ON" } else { "OFF" }
+                        );
+                    }
+                    b't' | b'T' => {
+                        if session_id.is_empty() {
+                            eprintln!("[flux-client] T: no session yet");
+                        } else {
+                            let idx = pattern_idx.fetch_add(1, Ordering::Relaxed) as usize;
+                            let pat_id = PATTERNS[idx % PATTERNS.len()];
+                            send_flux_c(
+                                flux_framing::FluxControl::test_pattern(&session_id, pat_id),
+                                &ctrl_seq,
+                            );
+                            eprintln!("[flux-client] FLUX-C test_pattern → {}", pat_id);
+                        }
+                    }
+                    b'h' | b'H' | b'?' => print_help(),
+                    _ => {}
                 }
             }
         });
@@ -353,8 +392,7 @@ fn run() {
 
     main_loop.run();
 
-    restore_termios(*old_termios_cell.lock().unwrap());
-
+    drop(tty); // restores termios
     pipeline.set_state(gst::State::Null).unwrap();
     eprintln!("[flux-client] Stopped");
 }
@@ -370,6 +408,10 @@ fn print_help() {
     eprintln!("  P     — send FLUX-C PTZ preset (ch 0)");
     eprintln!("  A     — toggle audio mute ch 0 via FLUX-C");
     eprintln!("  R     — show routing / session info");
+    eprintln!("  D     — toggle fps overlay on video window");
+    eprintln!(
+        "  T     — cycle server test pattern via FLUX-C (smpte→snow→black→circular→smpte75→ball→colors)"
+    );
     eprintln!("  H / ? — show this help");
     eprintln!();
 }
@@ -431,40 +473,56 @@ fn send_flux_c(cmd: flux_framing::FluxControl, seq_store: &Arc<Mutex<u32>>) {
 
 // ─── Raw terminal mode (macOS / POSIX) ───────────────────────────────────────
 //
-// We need single-keypress input without waiting for Enter.  We switch stdin to
-// raw (non-canonical, no echo) mode using libc termios calls.
+// We open /dev/tty directly — the controlling terminal — rather than reading
+// from stdin (fd 0).  On macOS, osxvideosink opens a Cocoa window that grabs
+// keyboard focus; while that window is focused, keypresses never arrive on
+// stdin.  /dev/tty always receives TTY input regardless of which window has
+// Cocoa focus, so this approach works reliably.
 
 #[cfg(unix)]
-type Termios = libc::termios;
+pub struct Tty {
+    fd: std::os::unix::io::RawFd,
+    old: libc::termios,
+}
 
 #[cfg(unix)]
-fn set_raw_mode() -> Option<Termios> {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+impl Drop for Tty {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.old) };
+        unsafe { libc::close(self.fd) };
+    }
+}
+
+#[cfg(unix)]
+fn open_tty_raw() -> Option<Tty> {
+    use std::ffi::CString;
+    let path = CString::new("/dev/tty").unwrap();
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        eprintln!("[flux-client] could not open /dev/tty");
+        return None;
+    }
     let mut old = unsafe { std::mem::zeroed::<libc::termios>() };
     if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+        unsafe { libc::close(fd) };
         return None;
     }
     let mut raw = old;
     unsafe {
-        libc::cfmakeraw(&mut raw);
+        // Only disable canonical mode and echo — do NOT call cfmakeraw, which
+        // also turns off OPOST/ONLCR output processing and causes eprintln!
+        // to print bare \n (no carriage return) producing a staircase effect.
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ECHOE | libc::ECHOK | libc::ECHONL);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
         libc::tcsetattr(fd, libc::TCSANOW, &raw);
     }
-    Some(old)
-}
-
-#[cfg(unix)]
-fn restore_termios(saved: Option<Termios>) {
-    if let Some(old) = saved {
-        use std::os::unix::io::AsRawFd;
-        let fd = std::io::stdin().as_raw_fd();
-        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
-    }
+    Some(Tty { fd, old })
 }
 
 #[cfg(not(unix))]
-fn set_raw_mode() -> Option<()> {
+pub struct Tty;
+#[cfg(not(unix))]
+fn open_tty_raw() -> Option<Tty> {
     None
 }
-#[cfg(not(unix))]
-fn restore_termios(_: Option<()>) {}

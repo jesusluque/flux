@@ -383,6 +383,9 @@ pub enum ControlType {
     AudioMix,
     /// Source routing redirect request (spec §7.3).
     Routing,
+    /// PoC extension — request the server source to switch videotestsrc pattern.
+    /// `pattern_id` maps directly to GStreamer `videotestsrc pattern` enum values.
+    TestPattern,
 }
 
 /// FLUX-C upstream control datagram (spec §12).
@@ -424,6 +427,12 @@ pub struct FluxControl {
     // ── Routing fields ────────────────────────────────────────────────────
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<String>,
+
+    // ── TestPattern fields ────────────────────────────────────────────────
+    /// GStreamer `videotestsrc` pattern enum value (0=smpte, 1=snow, 2=black,
+    /// 3=white, 18=ball, 19=smpte75, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern_id: Option<u32>,
 }
 
 impl FluxControl {
@@ -450,6 +459,7 @@ impl FluxControl {
             mute: None,
             gain_db: None,
             target_id: None,
+            pattern_id: None,
         }
     }
 
@@ -468,6 +478,7 @@ impl FluxControl {
             mute: Some(mute),
             gain_db: Some(gain_db),
             target_id: None,
+            pattern_id: None,
         }
     }
 
@@ -486,6 +497,30 @@ impl FluxControl {
             mute: None,
             gain_db: None,
             target_id: Some(target_id.into()),
+            pattern_id: None,
+        }
+    }
+
+    /// Build a test-pattern switch command (PoC extension).
+    ///
+    /// `pattern_id` maps to GStreamer `videotestsrc` pattern enum:
+    ///   0=smpte  1=snow  2=black  3=white  4=red  5=green  6=blue
+    ///   7=checkers-1  18=ball  19=smpte75  24=circular
+    pub fn test_pattern(session_id: &str, pattern_id: u32) -> Self {
+        FluxControl {
+            control_type: ControlType::TestPattern,
+            ts_ns: now_ns(),
+            session_id: session_id.into(),
+            channel_id: None,
+            pan_deg: None,
+            tilt_deg: None,
+            zoom_pos: None,
+            focus_pos: None,
+            speed: None,
+            mute: None,
+            gain_db: None,
+            target_id: None,
+            pattern_id: Some(pattern_id),
         }
     }
 
