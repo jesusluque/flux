@@ -3,13 +3,14 @@
 //! Pipeline:
 //!   fluxsrc address=127.0.0.1 port=7400
 //!     → fluxdemux  (routes media_0 and control/cdbc pads)
-//!         media_0 → fluxdeframer
+//!         media_0 → fluxcdbc (passthrough observer — sends CDBC_FEEDBACK)
+//!                     → fluxdeframer
 //!                     → h265parse
 //!                     → video/x-h265,stream-format=hvc1,alignment=au
 //!                     → vtdec_hw
 //!                     → videoconvertscale
 //!                     → osxvideosink
-//!         cdbc    → fluxcdbc server-address=127.0.0.1 server-port=7400 → fakesink
+//!         cdbc    → fakesink  (server→client CDBC echo — not used in PoC)
 //!
 //! ── Keyboard controls (stdin) ─────────────────────────────────────────────────
 //!
@@ -120,6 +121,11 @@ fn run() {
         .expect("add elements");
 
     fluxsrc.link(&fluxdemux).expect("fluxsrc → fluxdemux");
+    // fluxcdbc is passthrough — it observes raw FLUX frames and sends CDBC_FEEDBACK.
+    // Wire it in-line on media_0: fluxcdbc → fluxdeframer → h265parse → ...
+    fluxcdbc
+        .link(&fluxdeframer)
+        .expect("fluxcdbc → fluxdeframer");
     fluxdeframer.link(&h265parse).expect("deframer → h265parse");
 
     let hvc1_caps = gst::Caps::builder("video/x-h265")
@@ -136,32 +142,38 @@ fn run() {
     convert
         .link(&sink)
         .expect("videoconvertscale → osxvideosink");
-    fluxcdbc.link(&fakesink).expect("fluxcdbc → fakesink");
 
-    let deframer_clone = fluxdeframer.clone();
-    let cdbc_clone = fluxcdbc.clone();
+    // The demux `cdbc` pad carries server→client CDBC echoes (unused in PoC).
+    // We wire it to fakesink so the pad doesn't stall the pipeline.
+
+    let cdbc_fakesink_clone = fakesink.clone();
+    let cdbc_element_clone = fluxcdbc.clone();
     fluxdemux.connect_pad_added(move |_elem, pad| {
         let pad_name = pad.name();
         eprintln!("[flux-client] fluxdemux pad added: {}", pad_name);
         match pad_name.as_str() {
             "media_0" => {
-                let sink_pad = deframer_clone
+                // media_0 → fluxcdbc (passthrough observer) → fluxdeframer → ...
+                let cdbc_sink = cdbc_element_clone
                     .static_pad("sink")
-                    .expect("deframer sink pad");
-                if sink_pad.is_linked() {
-                    eprintln!("[flux-client] deframer sink already linked, skipping");
+                    .expect("fluxcdbc sink pad");
+                if cdbc_sink.is_linked() {
+                    eprintln!("[flux-client] fluxcdbc sink already linked, skipping");
                     return;
                 }
-                pad.link(&sink_pad).expect("link media_0 → fluxdeframer");
-                eprintln!("[flux-client] media_0 → fluxdeframer linked");
+                pad.link(&cdbc_sink).expect("link media_0 → fluxcdbc");
+                eprintln!("[flux-client] media_0 → fluxcdbc → fluxdeframer linked");
             }
             "cdbc" => {
-                let cdbc_sink = cdbc_clone.static_pad("sink").expect("cdbc sink pad");
-                if cdbc_sink.is_linked() {
+                // Server→client CDBC echo pad — drain into fakesink
+                let fs_sink = cdbc_fakesink_clone
+                    .static_pad("sink")
+                    .expect("fakesink sink pad");
+                if fs_sink.is_linked() {
                     return;
                 }
-                pad.link(&cdbc_sink).expect("link cdbc → fluxcdbc");
-                eprintln!("[flux-client] cdbc → fluxcdbc linked");
+                pad.link(&fs_sink).expect("link cdbc → fakesink");
+                eprintln!("[flux-client] cdbc (server echo) → fakesink linked");
             }
             _ => {
                 eprintln!("[flux-client] unhandled pad '{}' — ignoring", pad_name);
