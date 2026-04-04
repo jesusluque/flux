@@ -249,7 +249,8 @@ fn run() {
         let termios_ctl = old_termios_cell.clone();
         let audio_muted = audio_muted.clone();
         let ctrl_seq = ctrl_seq.clone();
-        let ctx = glib::MainContext::default();
+        // Use the context that main_loop.run() actually pumps, not the thread default.
+        let ctx = main_loop.context();
 
         std::thread::spawn(move || {
             use std::io::Read;

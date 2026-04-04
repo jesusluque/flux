@@ -66,6 +66,7 @@ mod imp {
     use gstreamer::prelude::*;
     use gstreamer::subclass::prelude::*;
     use gstreamer_base as gst_base;
+    use gstreamer_base::prelude::*;
     use gstreamer_base::subclass::prelude::*;
     use serde_json;
     use std::net::UdpSocket;
@@ -264,7 +265,7 @@ mod imp {
 
     impl BaseTransformImpl for FluxCdbc {
         const MODE: gst_base::subclass::BaseTransformMode =
-            gst_base::subclass::BaseTransformMode::NeverInPlace;
+            gst_base::subclass::BaseTransformMode::Both;
         const PASSTHROUGH_ON_SAME_CAPS: bool = true;
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
 
@@ -273,6 +274,8 @@ mod imp {
             let sock = UdpSocket::bind("0.0.0.0:0")
                 .map_err(|e| gst::error_msg!(gst::ResourceError::Failed, ["CDBC socket: {}", e]))?;
             m.sock = Some(sock);
+            // Enable passthrough mode: we only observe, never modify buffers.
+            self.obj().set_passthrough(true);
             Ok(())
         }
 

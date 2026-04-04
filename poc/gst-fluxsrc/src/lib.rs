@@ -422,7 +422,13 @@ mod imp {
                 let payload = &data[HEADER_SIZE..];
                 let frag = hdr.frag;
                 let seq = hdr.sequence_in_group;
-                eprintln!("[fluxsrc] rx {} bytes frag=0x{:X} seq={}", n, frag, seq);
+                gst::trace!(
+                    gst::CAT_DEFAULT,
+                    "rx {} bytes frag=0x{:X} seq={}",
+                    n,
+                    frag,
+                    seq
+                );
 
                 // ── Fragment reassembly ───────────────────────────────────────
                 let complete: Option<Vec<u8>> = {
