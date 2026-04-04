@@ -30,7 +30,6 @@ use gst::glib;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use std::net::UdpSocket;
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -227,112 +226,132 @@ fn run() {
         })
         .expect("bus watch");
 
-    // ── Keyboard input via GLib fd watch ────────────────────────────────────
+    // ── Keyboard input thread ────────────────────────────────────────────────
     //
-    // On macOS, gst::macos_main() owns the main thread (Cocoa run loop).
-    // A blocking stdin.read() in a background thread is unreliable there.
-    // The correct approach is to register stdin fd=0 with the GLib main loop
-    // via glib::unix_fd_add so keystrokes are delivered on the same thread
-    // as main_loop.run(), with no blocking or thread-safety issues.
+    // glib::unix_fd_add is unreliable for stdin on macOS when gst::macos_main
+    // owns the main thread (Cocoa run loop). Instead: a dedicated thread does
+    // a plain blocking read() — which always works for TTY stdin — and
+    // dispatches each keypress back onto the GLib main context via invoke(),
+    // so all GStreamer API calls happen on the correct thread.
 
-    // Put terminal into raw mode (single-keypress, no echo, no line buffer).
+    // Put terminal into raw mode (single-keypress, no echo).
     let old_termios = set_raw_mode();
     let old_termios_cell = Arc::new(Mutex::new(old_termios));
 
-    // Mute state (channel 0) toggled by 'A'
     let audio_muted = Arc::new(AtomicBool::new(false));
-    // FLUX-C sequence counter
     let ctrl_seq = Arc::new(Mutex::new(0u32));
 
-    let pipeline_ctl = pipeline.clone();
-    let fluxsrc_ctl = fluxsrc.clone();
-    let fluxcdbc_ctl = fluxcdbc.clone();
-    let main_loop_ctl = main_loop.clone();
-    let termios_ctl = old_termios_cell.clone();
+    {
+        let pipeline_ctl = pipeline.clone();
+        let fluxsrc_ctl = fluxsrc.clone();
+        let fluxcdbc_ctl = fluxcdbc.clone();
+        let main_loop_ctl = main_loop.clone();
+        let termios_ctl = old_termios_cell.clone();
+        let audio_muted = audio_muted.clone();
+        let ctrl_seq = ctrl_seq.clone();
+        let ctx = glib::MainContext::default();
 
-    let stdin_fd = std::io::stdin().as_raw_fd();
-    glib::unix_fd_add(stdin_fd, glib::IOCondition::IN, move |_fd, _cond| {
-        use std::io::Read;
-        let mut buf = [0u8; 1];
-        if std::io::stdin().lock().read(&mut buf).is_err() {
-            return ControlFlow::Break;
-        }
-        let key = buf[0];
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 1];
+            loop {
+                if std::io::stdin().lock().read(&mut buf).is_err() {
+                    break;
+                }
+                let key = buf[0];
 
-        let session_id: String = fluxsrc_ctl.property("session-id");
+                // Clone handles for the closure sent to the main context
+                let pipeline2 = pipeline_ctl.clone();
+                let fluxsrc2 = fluxsrc_ctl.clone();
+                let fluxcdbc2 = fluxcdbc_ctl.clone();
+                let main_loop2 = main_loop_ctl.clone();
+                let termios2 = termios_ctl.clone();
+                let muted2 = audio_muted.clone();
+                let seq2 = ctrl_seq.clone();
 
-        match key {
-            b' ' => {
-                let (_, cur, _) = pipeline_ctl.state(gst::ClockTime::NONE);
-                if cur == gst::State::Playing {
-                    pipeline_ctl.set_state(gst::State::Paused).ok();
-                    eprintln!("[flux-client] PAUSED");
-                } else {
-                    pipeline_ctl.set_state(gst::State::Playing).ok();
-                    eprintln!("[flux-client] PLAYING");
+                ctx.invoke(move || {
+                    let session_id: String = fluxsrc2.property("session-id");
+
+                    match key {
+                        b' ' => {
+                            let (_, cur, _) = pipeline2.state(gst::ClockTime::NONE);
+                            if cur == gst::State::Playing {
+                                pipeline2.set_state(gst::State::Paused).ok();
+                                eprintln!("[flux-client] PAUSED");
+                            } else {
+                                pipeline2.set_state(gst::State::Playing).ok();
+                                eprintln!("[flux-client] PLAYING");
+                            }
+                        }
+                        b'q' | b'Q' | 0x03 => {
+                            eprintln!("[flux-client] Quit");
+                            restore_termios(*termios2.lock().unwrap());
+                            main_loop2.quit();
+                        }
+                        b's' | b'S' => print_stats(&fluxsrc2, &fluxcdbc2),
+                        b'p' | b'P' => {
+                            send_flux_c(
+                                flux_framing::FluxControl::ptz(
+                                    &session_id,
+                                    0,
+                                    0.0,
+                                    0.0,
+                                    0.5,
+                                    0.5,
+                                    1.0,
+                                ),
+                                &seq2,
+                            );
+                            eprintln!("[flux-client] FLUX-C PTZ sent");
+                        }
+                        b'a' | b'A' => {
+                            let muted = !muted2.load(Ordering::Relaxed);
+                            muted2.store(muted, Ordering::Relaxed);
+                            let gain = if muted { -96.0f64 } else { 0.0f64 };
+                            send_flux_c(
+                                flux_framing::FluxControl::audio_mix(
+                                    &session_id,
+                                    vec![muted],
+                                    vec![gain],
+                                ),
+                                &seq2,
+                            );
+                            eprintln!(
+                                "[flux-client] audio ch0 -> {}",
+                                if muted { "MUTED" } else { "UNMUTED" }
+                            );
+                        }
+                        b'r' | b'R' => {
+                            eprintln!(
+                                "[flux-client] routing session={} server=127.0.0.1:7400",
+                                if session_id.is_empty() {
+                                    "<pending>"
+                                } else {
+                                    &session_id
+                                }
+                            );
+                            if !session_id.is_empty() {
+                                send_flux_c(
+                                    flux_framing::FluxControl::routing(&session_id, "current"),
+                                    &seq2,
+                                );
+                            }
+                        }
+                        b'h' | b'H' | b'?' => print_help(),
+                        _ => {}
+                    }
+                });
+
+                // Exit thread when Q/Ctrl-C pressed (main loop will quit via invoke above)
+                if matches!(key, b'q' | b'Q' | 0x03) {
+                    break;
                 }
             }
-
-            b'q' | b'Q' | 0x03 /* Ctrl-C */ => {
-                eprintln!("[flux-client] Quit");
-                restore_termios(*termios_ctl.lock().unwrap());
-                main_loop_ctl.quit();
-                return ControlFlow::Break;
-            }
-
-            b's' | b'S' => {
-                print_stats(&fluxsrc_ctl, &fluxcdbc_ctl);
-            }
-
-            b'p' | b'P' => {
-                send_flux_c(
-                    flux_framing::FluxControl::ptz(
-                        &session_id, 0, 0.0, 0.0, 0.5, 0.5, 1.0,
-                    ),
-                    &ctrl_seq,
-                );
-                eprintln!("[flux-client] FLUX-C PTZ preset sent (ch 0 pan=0 tilt=0 zoom=0.5)");
-            }
-
-            b'a' | b'A' => {
-                let muted = !audio_muted.load(Ordering::Relaxed);
-                audio_muted.store(muted, Ordering::Relaxed);
-                let gain = if muted { -96.0f64 } else { 0.0f64 };
-                send_flux_c(
-                    flux_framing::FluxControl::audio_mix(
-                        &session_id, vec![muted], vec![gain],
-                    ),
-                    &ctrl_seq,
-                );
-                eprintln!(
-                    "[flux-client] FLUX-C audio ch 0 -> {}",
-                    if muted { "MUTED" } else { "UNMUTED" }
-                );
-            }
-
-            b'r' | b'R' => {
-                eprintln!(
-                    "[flux-client] FLUX-C routing — session_id={}  server=127.0.0.1:7400",
-                    if session_id.is_empty() { "<not yet negotiated>" } else { &session_id }
-                );
-                if !session_id.is_empty() {
-                    send_flux_c(
-                        flux_framing::FluxControl::routing(&session_id, "current"),
-                        &ctrl_seq,
-                    );
-                }
-            }
-
-            b'h' | b'H' | b'?' => print_help(),
-
-            _ => {}
-        }
-        ControlFlow::Continue
-    });
+        });
+    }
 
     main_loop.run();
 
-    // Restore terminal before exiting (normal path — quit via bus EOS/error)
     restore_termios(*old_termios_cell.lock().unwrap());
 
     pipeline.set_state(gst::State::Null).unwrap();

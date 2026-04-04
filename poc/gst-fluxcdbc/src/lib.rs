@@ -241,7 +241,7 @@ mod imp {
         fn pad_templates() -> &'static [gst::PadTemplate] {
             static PADS: std::sync::OnceLock<Vec<gst::PadTemplate>> = std::sync::OnceLock::new();
             PADS.get_or_init(|| {
-                let caps = gst::Caps::new_any();
+                let caps = gst::Caps::builder("application/x-flux").build();
                 vec![
                     gst::PadTemplate::new(
                         "sink",
