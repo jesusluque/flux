@@ -148,6 +148,11 @@ fn run() {
         .expect("add elements");
 
     fluxsrc.link(&fluxdemux).expect("fluxsrc → fluxdemux");
+    // fluxcdbc is passthrough — insert it in-line on media_0 so it observes
+    // actual MediaData frames and sends CDBC_FEEDBACK to the server.
+    fluxcdbc
+        .link(&fluxdeframer)
+        .expect("fluxcdbc → fluxdeframer");
     fluxdeframer
         .link(&h265parse)
         .expect("fluxdeframer → h265parse");
@@ -166,32 +171,35 @@ fn run() {
     convert
         .link(&fpsdisplaysink)
         .expect("videoconvertscale → fpsdisplaysink");
-    fluxcdbc.link(&fakesink).expect("fluxcdbc → fakesink");
+    // fakesink drains the demux 'cdbc' pad (server→client CDBC echoes, unused in PoC)
 
     // ── Dynamic pad linking ───────────────────────────────────────────────────
-    let deframer_clone = fluxdeframer.clone();
-    let cdbc_clone = fluxcdbc.clone();
+    let cdbc_element_clone = fluxcdbc.clone();
+    let fakesink_clone = fakesink.clone();
     fluxdemux.connect_pad_added(move |_elem, pad| {
         let pad_name = pad.name();
         eprintln!("[flux-test-client] fluxdemux pad added: {}", pad_name);
         match pad_name.as_str() {
             "media_0" => {
-                let sink_pad = deframer_clone
+                // media_0 → fluxcdbc (passthrough observer) → fluxdeframer → ...
+                let cdbc_sink = cdbc_element_clone
                     .static_pad("sink")
-                    .expect("deframer sink pad");
-                if sink_pad.is_linked() {
-                    return;
-                }
-                pad.link(&sink_pad).expect("link media_0 → fluxdeframer");
-                eprintln!("[flux-test-client] media_0 → fluxdeframer linked");
-            }
-            "cdbc" => {
-                let cdbc_sink = cdbc_clone.static_pad("sink").expect("cdbc sink pad");
+                    .expect("fluxcdbc sink pad");
                 if cdbc_sink.is_linked() {
                     return;
                 }
-                pad.link(&cdbc_sink).expect("link cdbc → fluxcdbc");
-                eprintln!("[flux-test-client] cdbc → fluxcdbc linked");
+                pad.link(&cdbc_sink).expect("link media_0 → fluxcdbc");
+                eprintln!("[flux-test-client] media_0 → fluxcdbc → fluxdeframer linked");
+            }
+            "cdbc" => {
+                let fs_sink = fakesink_clone
+                    .static_pad("sink")
+                    .expect("fakesink sink pad");
+                if fs_sink.is_linked() {
+                    return;
+                }
+                pad.link(&fs_sink).expect("link cdbc → fakesink");
+                eprintln!("[flux-test-client] cdbc (server echo) → fakesink linked");
             }
             _ => {
                 eprintln!("[flux-test-client] unhandled pad '{}' — ignoring", pad_name);
