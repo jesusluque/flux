@@ -239,38 +239,66 @@ mod imp {
             let pad_name = pad_name_for(hdr.frame_type);
             let obj = self.obj();
 
-            let src_pad = {
-                let mut inner = self.inner.lock().unwrap();
-                if !inner.src_pads.contains_key(pad_name) {
-                    let tmpl = obj
-                        .pad_template(pad_name)
-                        .or_else(|| obj.pad_template("misc"));
-                    if let Some(tmpl) = tmpl {
-                        let pad = gst::Pad::builder_from_template(&tmpl)
-                            .name(pad_name)
-                            .build();
-                        pad.set_active(true).ok();
-                        // add_pad emits pad-added signal automatically (triggers downstream linking)
-                        obj.add_pad(&pad).ok();
-                        // Replay sticky events AFTER downstream has linked (pad-added is synchronous)
-                        if let Some(ref ev) = inner.stream_start {
-                            let _ = pad.push_event(ev.clone());
-                        }
-                        if let Some(ref ev) = inner.caps_ev {
-                            let _ = pad.push_event(ev.clone());
-                        }
-                        if let Some(ref ev) = inner.segment {
-                            let _ = pad.push_event(ev.clone());
-                        }
-                        inner.src_pads.insert(pad_name.to_string(), pad);
-                        gst::info!(
-                            gst::CAT_DEFAULT,
-                            "FluxDemux: created src pad '{}'",
-                            pad_name
-                        );
+            // Check if the src pad already exists (fast path, no pad creation).
+            let existing = self.inner.lock().unwrap().src_pads.get(pad_name).cloned();
+
+            let src_pad = if existing.is_some() {
+                existing
+            } else {
+                // Build the new pad outside the mutex to avoid deadlock:
+                // add_pad() fires pad-added synchronously, and push_event() can
+                // trigger upstream caps queries — both must not hold inner's mutex.
+                let tmpl = obj
+                    .pad_template(pad_name)
+                    .or_else(|| obj.pad_template("misc"));
+                if let Some(tmpl) = tmpl {
+                    let new_pad = gst::Pad::builder_from_template(&tmpl)
+                        .name(pad_name)
+                        .build();
+                    new_pad.set_active(true).ok();
+
+                    // add_pad fires pad-added → downstream links the pad
+                    obj.add_pad(&new_pad).ok();
+
+                    // Replay cached sticky events so downstream elements get
+                    // STREAM_START, CAPS (application/x-flux) and SEGMENT.
+                    // Must be done outside the mutex.
+                    let (ss, caps, seg) = {
+                        let inner = self.inner.lock().unwrap();
+                        (
+                            inner.stream_start.clone(),
+                            inner.caps_ev.clone(),
+                            inner.segment.clone(),
+                        )
+                    };
+                    if let Some(ev) = ss {
+                        let _ = new_pad.push_event(ev);
                     }
+                    if let Some(ev) = caps {
+                        let _ = new_pad.push_event(ev);
+                    }
+                    if let Some(ev) = seg {
+                        let _ = new_pad.push_event(ev);
+                    }
+
+                    gst::info!(
+                        gst::CAT_DEFAULT,
+                        "FluxDemux: created src pad '{}'",
+                        pad_name
+                    );
+
+                    // Store and return the new pad
+                    let mut inner = self.inner.lock().unwrap();
+                    // Another thread may have inserted while we were unlocked
+                    inner
+                        .src_pads
+                        .entry(pad_name.to_string())
+                        .or_insert(new_pad)
+                        .clone()
+                        .into()
+                } else {
+                    None
                 }
-                inner.src_pads.get(pad_name).cloned()
             };
 
             if let Some(pad) = src_pad {

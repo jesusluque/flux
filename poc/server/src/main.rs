@@ -1,7 +1,7 @@
 //! FLUX PoC — Server
 //!
 //! Pipeline:
-//!   videotestsrc pattern=ball is-live=true
+//!   videotestsrc pattern=smpte is-live=true
 //!     → videoconvertscale
 //!     → video/x-raw,width=1280,height=720,framerate=60/1
 //!     → vtenc_h265  (Apple VideoToolbox HW encoder)
@@ -26,7 +26,7 @@ fn main() {
 
     // ── Build pipeline ────────────────────────────────────────────────────────
     let pipeline_desc = "\
-        videotestsrc pattern=ball is-live=true ! \
+        videotestsrc pattern=smpte is-live=true ! \
         videoconvertscale ! \
         video/x-raw,width=1280,height=720,framerate=60/1 ! \
         vtenc_h265 realtime=true allow-frame-reordering=false bitrate=4000 ! \

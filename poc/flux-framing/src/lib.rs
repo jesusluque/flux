@@ -373,6 +373,59 @@ pub fn now_ns() -> u64 {
         .as_nanos() as u64
 }
 
+// ─── Fragmentation helpers (PoC §4.1 FRAG field) ─────────────────────────────
+//
+// FRAG encoding used in this PoC:
+//   0x0          → single unfragmented datagram
+//   0x1 .. 0xE   → fragment index (1-based), more fragments follow
+//   0xF          → last fragment of a multi-fragment AU
+//
+// All fragments of one AU share the same SEQUENCE_IN_GROUP value.
+// Maximum payload chunk per datagram: FRAG_MTU bytes.
+
+/// Maximum payload bytes carried in a single UDP datagram.
+/// macOS limits UDP datagrams to net.inet.udp.maxdgram = 9216 bytes by default.
+/// We use 8192 bytes of payload + 32-byte FLUX header = 8224 bytes total, safely
+/// under the 9216-byte OS limit.
+pub const FRAG_MTU: usize = 8_192;
+
+/// Encode `payload` as one or more (header_bytes, chunk) pairs ready to be
+/// sent as UDP datagrams.  `hdr` is the template header (frag=0, correct flags,
+/// seq, payload_length = full payload length).
+///
+/// Returns a `Vec` of fully-serialized datagrams (header ++ chunk).
+pub fn fragment_encode(hdr: &FluxHeader, payload: &[u8]) -> Vec<Vec<u8>> {
+    if payload.len() <= FRAG_MTU {
+        // Single unfragmented datagram, frag=0
+        let mut h = hdr.clone();
+        h.frag = 0;
+        h.payload_length = payload.len() as u32;
+        let header_bytes = h.encode();
+        let mut dg = Vec::with_capacity(HEADER_SIZE + payload.len());
+        dg.extend_from_slice(&header_bytes);
+        dg.extend_from_slice(payload);
+        return vec![dg];
+    }
+
+    let chunks: Vec<&[u8]> = payload.chunks(FRAG_MTU).collect();
+    let n = chunks.len();
+    let mut datagrams = Vec::with_capacity(n);
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let mut h = hdr.clone();
+        // frag index: first fragment = 1, last fragment = 0xF
+        h.frag = if i == n - 1 { 0xF } else { (i + 1) as u8 };
+        // payload_length in each fragment = size of this chunk
+        h.payload_length = chunk.len() as u32;
+        let header_bytes = h.encode();
+        let mut dg = Vec::with_capacity(HEADER_SIZE + chunk.len());
+        dg.extend_from_slice(&header_bytes);
+        dg.extend_from_slice(chunk);
+        datagrams.push(dg);
+    }
+    datagrams
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

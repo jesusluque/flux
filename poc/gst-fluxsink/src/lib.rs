@@ -183,22 +183,42 @@ mod imp {
         }
 
         fn render(&self, buffer: &gst::Buffer) -> Result<gst::FlowSuccess, gst::FlowError> {
+            use flux_framing::{fragment_encode, FluxHeader, HEADER_SIZE};
+
             let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+            let data = map.as_slice();
+
+            // The buffer is a complete FLUX frame: 32-byte header + H.265 payload.
+            // Parse the header so we can re-use its fields when fragmenting.
+            let hdr = FluxHeader::decode(data).ok_or_else(|| {
+                eprintln!("[fluxsink] malformed FLUX header");
+                gst::FlowError::Error
+            })?;
+            let payload = &data[HEADER_SIZE..];
+
             let s = self.inner.lock().unwrap();
             let sock = s.udp_sock.as_ref().ok_or(gst::FlowError::Error)?.clone();
+            let port = s.port;
 
             // Resolve client address: set by TCP handshake, fallback to loopback
             let dst: SocketAddr = s
                 .client_addr
                 .lock()
                 .unwrap()
-                .unwrap_or_else(|| "127.0.0.1:7402".parse().unwrap());
+                .unwrap_or_else(|| format!("127.0.0.1:{}", port + 2).parse().unwrap());
             drop(s);
 
-            sock.send_to(map.as_slice(), dst).map_err(|e| {
-                eprintln!("[fluxsink] UDP send error: {}", e);
-                gst::FlowError::Error
-            })?;
+            for datagram in fragment_encode(&hdr, payload) {
+                eprintln!(
+                    "[fluxsink] sending datagram {} bytes to {}",
+                    datagram.len(),
+                    dst
+                );
+                sock.send_to(&datagram, dst).map_err(|e| {
+                    eprintln!("[fluxsink] UDP send error: {}", e);
+                    gst::FlowError::Error
+                })?;
+            }
             Ok(gst::FlowSuccess::Ok)
         }
     }

@@ -71,6 +71,12 @@ mod imp {
 
     // ─── State ────────────────────────────────────────────────────────────────
 
+    /// In-progress fragment reassembly buffer for one AU.
+    struct FragAssembly {
+        seq: u32,
+        data: Vec<u8>,
+    }
+
     struct Inner {
         server_addr: String,
         port: u16,
@@ -80,6 +86,8 @@ mod imp {
         keepalive_seq: u32,
         last_ka: Instant,
         ka_interval: Duration,
+        /// Fragment reassembly state (None = no in-progress AU)
+        frag_assembly: Option<FragAssembly>,
     }
 
     impl Default for Inner {
@@ -93,6 +101,7 @@ mod imp {
                 keepalive_seq: 0,
                 last_ka: Instant::now(),
                 ka_interval: Duration::from_millis(1000),
+                frag_assembly: None,
             }
         }
     }
@@ -279,57 +288,124 @@ mod imp {
         ) -> Result<gst_base::subclass::base_src::CreateSuccess, FlowError> {
             let mut recv_buf = vec![0u8; 65536];
 
-            let (sock_clone, _server_udp, _session_id) = {
-                let mut s = self.inner.lock().unwrap();
-                let sock = s.udp_sock.as_ref().ok_or(FlowError::Error)?.clone();
-                let server_udp = s.server_udp;
-                let sid = s.session_id.clone();
+            loop {
+                let sock_clone = {
+                    let mut s = self.inner.lock().unwrap();
+                    let sock = s.udp_sock.as_ref().ok_or(FlowError::Error)?.clone();
+                    let server_udp = s.server_udp;
+                    let sid = s.session_id.clone();
 
-                // Send KEEPALIVE if interval elapsed
-                if s.last_ka.elapsed() >= s.ka_interval {
-                    if let Some(dst) = server_udp {
-                        let ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
-                        let ka_payload = KeepalivePayload {
-                            ts_ns: now_ns(),
-                            session_id: sid.clone(),
-                            seq: s.keepalive_seq,
-                        };
-                        let ka_json = serde_json::to_vec(&ka_payload).unwrap();
-                        let mut pkt = Vec::with_capacity(HEADER_SIZE + ka_json.len());
-                        pkt.extend_from_slice(&ka_hdr.encode());
-                        pkt.extend_from_slice(&ka_json);
-                        let _ = sock.send_to(&pkt, dst);
-                        s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
-                        s.last_ka = Instant::now();
+                    // Send KEEPALIVE if interval elapsed
+                    if s.last_ka.elapsed() >= s.ka_interval {
+                        if let Some(dst) = server_udp {
+                            let ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
+                            let ka_payload = KeepalivePayload {
+                                ts_ns: now_ns(),
+                                session_id: sid.clone(),
+                                seq: s.keepalive_seq,
+                            };
+                            let ka_json = serde_json::to_vec(&ka_payload).unwrap();
+                            let mut pkt = Vec::with_capacity(HEADER_SIZE + ka_json.len());
+                            pkt.extend_from_slice(&ka_hdr.encode());
+                            pkt.extend_from_slice(&ka_json);
+                            let _ = sock.send_to(&pkt, dst);
+                            s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
+                            s.last_ka = Instant::now();
+                        }
                     }
-                }
 
-                (sock.clone(), server_udp, sid)
-            };
+                    sock.clone()
+                };
 
-            // Blocking receive (with 500 ms timeout set in start())
-            match sock_clone.recv_from(&mut recv_buf) {
-                Ok((n, _from)) => {
-                    let data = &recv_buf[..n];
+                // Blocking receive (with 500 ms timeout set in start())
+                let (n, _from) = match sock_clone.recv_from(&mut recv_buf) {
+                    Ok(v) => v,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                    {
+                        // No packet yet — loop to retry (keepalive will be sent on
+                        // next iteration if the interval has elapsed).
+                        continue;
+                    }
+                    Err(e) => {
+                        gst::warning!(gst::CAT_DEFAULT, "UDP recv error: {}", e);
+                        return Err(FlowError::Error);
+                    }
+                };
+
+                let data = &recv_buf[..n];
+
+                // Parse the FLUX header to check fragment field
+                let hdr = match FluxHeader::decode(data) {
+                    Some(h) => h,
+                    None => continue, // malformed, skip
+                };
+
+                let payload = &data[HEADER_SIZE..];
+                let frag = hdr.frag;
+                let seq = hdr.sequence_in_group;
+                eprintln!("[fluxsrc] rx {} bytes frag=0x{:X} seq={}", n, frag, seq);
+
+                let complete: Option<Vec<u8>> = {
+                    let mut s = self.inner.lock().unwrap();
+
+                    if frag == 0x0 {
+                        // Unfragmented — emit immediately, discard any stale assembly
+                        s.frag_assembly = None;
+                        Some(data.to_vec())
+                    } else if frag == 0xF {
+                        // Last fragment — append and emit
+                        if let Some(ref mut asm) = s.frag_assembly {
+                            if asm.seq == seq {
+                                asm.data.extend_from_slice(payload);
+                                // Reassemble: prepend original header with frag=0
+                                let mut full = Vec::with_capacity(HEADER_SIZE + asm.data.len());
+                                let mut emit_hdr = hdr.clone();
+                                emit_hdr.frag = 0;
+                                emit_hdr.payload_length = asm.data.len() as u32;
+                                full.extend_from_slice(&emit_hdr.encode());
+                                full.extend_from_slice(&asm.data);
+                                s.frag_assembly = None;
+                                Some(full)
+                            } else {
+                                // Sequence mismatch — stale, discard and start fresh
+                                s.frag_assembly = None;
+                                None
+                            }
+                        } else {
+                            // Last fragment with no open assembly — discard
+                            None
+                        }
+                    } else {
+                        // Intermediate fragment (frag 1..0xE)
+                        match s.frag_assembly {
+                            Some(ref mut asm) if asm.seq == seq => {
+                                asm.data.extend_from_slice(payload);
+                            }
+                            _ => {
+                                // New AU or stale seq — start fresh
+                                s.frag_assembly = Some(FragAssembly {
+                                    seq,
+                                    data: payload.to_vec(),
+                                });
+                            }
+                        }
+                        None
+                    }
+                };
+
+                if let Some(full_data) = complete {
+                    let n = full_data.len();
                     let mut buf = gst::Buffer::with_size(n).map_err(|_| FlowError::Error)?;
                     {
                         let buf_ref = buf.get_mut().unwrap();
                         let mut map = buf_ref.map_writable().map_err(|_| FlowError::Error)?;
-                        map[..n].copy_from_slice(data);
+                        map[..n].copy_from_slice(&full_data);
                     }
-                    Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf))
+                    return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
                 }
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    let buf = gst::Buffer::with_size(0).map_err(|_| FlowError::Error)?;
-                    Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf))
-                }
-                Err(e) => {
-                    gst::warning!(gst::CAT_DEFAULT, "UDP recv error: {}", e);
-                    Err(FlowError::Error)
-                }
+                // else: loop again to receive the next fragment
             }
         }
     }
