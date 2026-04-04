@@ -341,6 +341,7 @@ mod imp {
                     jitter_ms: m.jitter_ms,
                     fps_actual: 0.0,
                     datagram_drop_count: m.lost_count,
+                    probe_result_bps: 0,
                 };
 
                 m.last_fb = fb.clone();

@@ -357,6 +357,10 @@ pub struct CdbcFeedback {
     pub jitter_ms: f64,
     pub fps_actual: f64,
     pub datagram_drop_count: u64,
+    /// Measured receive bandwidth from the most recent BANDWIDTH_PROBE (bps).
+    /// Zero if no probe result is available.
+    #[serde(default)]
+    pub probe_result_bps: u64,
 }
 
 /// KEEPALIVE payload (spec §3.3)
@@ -365,6 +369,179 @@ pub struct KeepalivePayload {
     pub ts_ns: u64,
     pub session_id: String,
     pub seq: u32,
+}
+
+/// BANDWIDTH_PROBE payload (spec §5.3 / frame type 0xD)
+///
+/// Sent server → client as a padded datagram; the client measures the
+/// arrival bandwidth and returns it in the next CDBC_FEEDBACK.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BandwidthProbe {
+    /// Timestamp when the probe was sent (ns since UNIX epoch).
+    pub ts_ns: u64,
+    /// Probe sequence number (monotonically increasing per session).
+    pub probe_seq: u32,
+    /// Nominal probe size in bytes (so the receiver can verify it).
+    pub probe_size: u32,
+}
+
+// ─── BW Governor (spec §5.3) ──────────────────────────────────────────────────
+
+/// States of the server-side BW Governor state machine (spec §5.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BwState {
+    /// Sending BANDWIDTH_PROBE datagrams; waiting for probe_result_bps.
+    Probe,
+    /// Link is healthy; holding current layer set.
+    Stable,
+    /// Available bandwidth is growing; ramping up to add an enhancement layer.
+    RampUp,
+    /// Available bandwidth is shrinking; dropping top enhancement layer.
+    RampDown,
+    /// Severe congestion; executing shed-then-protect sequence (spec §5.4).
+    Emergency,
+}
+
+/// Server-side BW Governor.
+///
+/// Call [`BwGovernor::ingest`] each time a `CdbcFeedback` arrives.
+/// The returned [`BwAction`] tells the caller what to do next.
+pub struct BwGovernor {
+    pub state: BwState,
+    /// Current baseline bitrate in bps (set from last accepted report).
+    pub current_bps: u64,
+    /// Number of consecutive RAMP_UP-qualifying reports.
+    ramp_up_count: u32,
+    /// Number of consecutive loss-free reports during EMERGENCY recovery.
+    recovery_count: u32,
+    /// Timestamp of the last state transition (for probe timeout logic).
+    pub state_entered: std::time::Instant,
+}
+
+/// Action the server should take after processing a CDBC_FEEDBACK report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BwAction {
+    /// Nothing to do; continue as-is.
+    Hold,
+    /// Send a BANDWIDTH_PROBE datagram now.
+    SendProbe,
+    /// Add an enhancement layer (increase quality / bitrate).
+    AddLayer,
+    /// Drop the top enhancement layer.
+    DropLayer,
+    /// Execute EMERGENCY shed sequence: drop all enhancement layers, disable
+    /// monitor streams, pause EMBED_CHUNK, reduce fps if negotiated.
+    EmergencyShed,
+    /// EMERGENCY step 3: enable XOR Row FEC on base layer (loss_pct > 5 %).
+    EnableFec,
+    /// EMERGENCY step 3: switch to Reed-Solomon 2D + IDR-only mode (loss > 15 %).
+    EnableFecRS,
+    /// Transition from EMERGENCY back to RAMP_UP after 5 clean reports.
+    RecoveryRampUp,
+}
+
+impl BwGovernor {
+    pub fn new() -> Self {
+        BwGovernor {
+            state: BwState::Probe,
+            current_bps: 0,
+            ramp_up_count: 0,
+            recovery_count: 0,
+            state_entered: std::time::Instant::now(),
+        }
+    }
+
+    /// Process one CDBC_FEEDBACK report and return the recommended action.
+    ///
+    /// Implements the state machine from spec §5.3 + §5.4.
+    pub fn ingest(&mut self, fb: &CdbcFeedback) -> BwAction {
+        let avail = fb.avail_bps;
+        let loss = fb.loss_pct;
+
+        match self.state {
+            BwState::Probe => {
+                // If we got a probe result, adopt it and move to STABLE
+                if fb.probe_result_bps > 0 {
+                    self.current_bps = fb.probe_result_bps;
+                } else if avail > 0 {
+                    self.current_bps = avail;
+                }
+                self.transition(BwState::Stable);
+                BwAction::Hold
+            }
+
+            BwState::Stable => {
+                if loss > 5.0 {
+                    self.transition(BwState::Emergency);
+                    return BwAction::EmergencyShed;
+                }
+                if self.current_bps > 0 && avail < (self.current_bps * 85 / 100) {
+                    self.transition(BwState::RampDown);
+                    return BwAction::DropLayer;
+                }
+                if self.current_bps > 0 && avail > (self.current_bps * 115 / 100) {
+                    self.ramp_up_count += 1;
+                    if self.ramp_up_count >= 3 {
+                        self.ramp_up_count = 0;
+                        self.transition(BwState::RampUp);
+                        return BwAction::AddLayer;
+                    }
+                } else {
+                    self.ramp_up_count = 0;
+                }
+                // Periodically re-probe (every ~5 s) to refresh baseline
+                if self.state_entered.elapsed().as_secs() >= 5 {
+                    self.transition(BwState::Probe);
+                    return BwAction::SendProbe;
+                }
+                BwAction::Hold
+            }
+
+            BwState::RampUp => {
+                // After adding a layer, update baseline and return to STABLE
+                self.current_bps = avail;
+                self.transition(BwState::Stable);
+                BwAction::Hold
+            }
+
+            BwState::RampDown => {
+                self.current_bps = avail;
+                if loss > 5.0 {
+                    self.transition(BwState::Emergency);
+                    return BwAction::EmergencyShed;
+                }
+                self.transition(BwState::Stable);
+                BwAction::Hold
+            }
+
+            BwState::Emergency => {
+                // §5.4 STEP 3: check if FEC is needed after shedding
+                if loss > 15.0 {
+                    return BwAction::EnableFecRS;
+                }
+                if loss > 5.0 {
+                    return BwAction::EnableFec;
+                }
+                // §5.4 STEP 4: 5 clean reports → RAMP_UP
+                if loss < 1.0 {
+                    self.recovery_count += 1;
+                    if self.recovery_count >= 5 {
+                        self.recovery_count = 0;
+                        self.transition(BwState::RampUp);
+                        return BwAction::RecoveryRampUp;
+                    }
+                } else {
+                    self.recovery_count = 0;
+                }
+                BwAction::Hold
+            }
+        }
+    }
+
+    fn transition(&mut self, next: BwState) {
+        self.state = next;
+        self.state_entered = std::time::Instant::now();
+    }
 }
 
 // ─── Utility ─────────────────────────────────────────────────────────────────
@@ -506,5 +683,92 @@ mod tests {
         assert_eq!(back.keepalive_interval_ms, accept.keepalive_interval_ms);
         assert_eq!(back.keepalive_timeout, accept.keepalive_timeout);
         assert_eq!(back.max_datagram_size, accept.max_datagram_size);
+    }
+
+    #[test]
+    fn bw_governor_stable_to_ramp_up() {
+        let mut gov = BwGovernor::new();
+
+        // First: absorb initial PROBE report to set current_bps
+        let probe_report = CdbcFeedback {
+            ts_ns: 0,
+            rx_bps: 50_000_000,
+            avail_bps: 50_000_000,
+            rtt_ms: 5.0,
+            loss_pct: 0.0,
+            jitter_ms: 0.5,
+            fps_actual: 60.0,
+            datagram_drop_count: 0,
+            probe_result_bps: 55_000_000,
+        };
+        gov.ingest(&probe_report); // PROBE → STABLE, current_bps = 55 Mbps
+
+        assert_eq!(gov.state, BwState::Stable);
+        assert_eq!(gov.current_bps, 55_000_000);
+
+        // Send 3 × avail > 1.15 × current → RAMP_UP on the 3rd
+        let ramp_report = CdbcFeedback {
+            avail_bps: 65_000_000, // 118% of 55 Mbps
+            loss_pct: 0.0,
+            ..probe_report.clone()
+        };
+        assert_eq!(gov.ingest(&ramp_report), BwAction::Hold); // count=1
+        assert_eq!(gov.ingest(&ramp_report), BwAction::Hold); // count=2
+        assert_eq!(gov.ingest(&ramp_report), BwAction::AddLayer); // count=3 → RAMP_UP
+        assert_eq!(gov.state, BwState::RampUp);
+    }
+
+    #[test]
+    fn bw_governor_stable_to_ramp_down() {
+        let mut gov = BwGovernor::new();
+        // Seed PROBE → STABLE at 50 Mbps
+        gov.ingest(&CdbcFeedback {
+            probe_result_bps: 50_000_000,
+            avail_bps: 50_000_000,
+            loss_pct: 0.0,
+            ..CdbcFeedback::default()
+        });
+        assert_eq!(gov.state, BwState::Stable);
+
+        // avail < 85% of 50 Mbps → RAMP_DOWN
+        let action = gov.ingest(&CdbcFeedback {
+            avail_bps: 40_000_000, // 80%
+            loss_pct: 0.0,
+            ..CdbcFeedback::default()
+        });
+        assert_eq!(action, BwAction::DropLayer);
+        assert_eq!(gov.state, BwState::RampDown);
+    }
+
+    #[test]
+    fn bw_governor_emergency_recovery() {
+        let mut gov = BwGovernor::new();
+        gov.ingest(&CdbcFeedback {
+            probe_result_bps: 50_000_000,
+            avail_bps: 50_000_000,
+            loss_pct: 0.0,
+            ..CdbcFeedback::default()
+        });
+
+        // High loss → EMERGENCY
+        let action = gov.ingest(&CdbcFeedback {
+            avail_bps: 50_000_000,
+            loss_pct: 8.0,
+            ..CdbcFeedback::default()
+        });
+        assert_eq!(action, BwAction::EmergencyShed);
+        assert_eq!(gov.state, BwState::Emergency);
+
+        // 5 × clean reports → RecoveryRampUp
+        let clean = CdbcFeedback {
+            avail_bps: 50_000_000,
+            loss_pct: 0.0,
+            ..CdbcFeedback::default()
+        };
+        for _ in 0..4 {
+            assert_eq!(gov.ingest(&clean), BwAction::Hold);
+        }
+        assert_eq!(gov.ingest(&clean), BwAction::RecoveryRampUp);
+        assert_eq!(gov.state, BwState::RampUp);
     }
 }

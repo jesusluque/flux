@@ -44,7 +44,10 @@ impl FluxSink {
 
 mod imp {
     use super::*;
-    use flux_framing::{now_ns, SessionAccept, SessionRequest, DEFAULT_PORT};
+    use flux_framing::{
+        now_ns, BandwidthProbe, BwAction, BwGovernor, CdbcFeedback, FluxHeader, FrameType,
+        SessionAccept, SessionRequest, DEFAULT_PORT, HEADER_SIZE,
+    };
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
     use std::io::{Read, Write};
@@ -58,6 +61,10 @@ mod imp {
         port: u16,
         udp_sock: Option<Arc<UdpSocket>>,
         client_addr: Arc<Mutex<Option<SocketAddr>>>,
+        /// Shared BW Governor; written by the CDBC reader thread.
+        bw_gov: Arc<Mutex<BwGovernor>>,
+        /// Monotonically increasing probe sequence number.
+        probe_seq: Arc<AtomicU32>,
     }
 
     impl Default for Inner {
@@ -67,6 +74,8 @@ mod imp {
                 port: DEFAULT_PORT,
                 udp_sock: None,
                 client_addr: Arc::new(Mutex::new(None)),
+                bw_gov: Arc::new(Mutex::new(BwGovernor::new())),
+                probe_seq: Arc::new(AtomicU32::new(1)),
             }
         }
     }
@@ -169,6 +178,15 @@ mod imp {
                 run_control_listener(&ctrl_addr, client_ref);
             });
 
+            // Spawn CDBC feedback reader thread (reads from the same UDP socket)
+            let cdbc_sock = sock.clone();
+            let bw_ref = s.bw_gov.clone();
+            let probe_seq_ref = s.probe_seq.clone();
+            let client_addr_ref = s.client_addr.clone();
+            thread::spawn(move || {
+                run_cdbc_reader(cdbc_sock, bw_ref, probe_seq_ref, client_addr_ref);
+            });
+
             eprintln!(
                 "[fluxsink] UDP bound on {}  |  TCP control on :{}",
                 addr,
@@ -221,6 +239,142 @@ mod imp {
                 })?;
             }
             Ok(gst::FlowSuccess::Ok)
+        }
+    }
+
+    /// Reads incoming UDP datagrams on the media port, dispatches CDBC_FEEDBACK
+    /// frames to the BW Governor, and sends BANDWIDTH_PROBE when requested.
+    fn run_cdbc_reader(
+        sock: Arc<UdpSocket>,
+        bw_gov: Arc<Mutex<BwGovernor>>,
+        probe_seq: Arc<AtomicU32>,
+        client_addr: Arc<Mutex<Option<SocketAddr>>>,
+    ) {
+        // Allow the socket to be shared: clone a reference for reading.
+        // The socket is blocking; recv_from will wait for the next datagram.
+        let mut buf = [0u8; 65536];
+        loop {
+            let (n, from) = match sock.recv_from(&mut buf) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[fluxsink/cdbc] recv error: {}", e);
+                    break;
+                }
+            };
+            let data = &buf[..n];
+
+            if data.len() < HEADER_SIZE {
+                continue;
+            }
+
+            let hdr = match FluxHeader::decode(data) {
+                Some(h) => h,
+                None => continue,
+            };
+
+            if hdr.frame_type != FrameType::CdbcFeedbackT {
+                // Not a CDBC frame — ignore (media data also arrives here from
+                // loopback tests, but the loopback sends to port+2, not port)
+                continue;
+            }
+
+            let body = &data[HEADER_SIZE..];
+            let fb: CdbcFeedback = match serde_json::from_slice(body) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[fluxsink/cdbc] bad CDBC_FEEDBACK from {}: {}", from, e);
+                    continue;
+                }
+            };
+
+            eprintln!(
+                "[fluxsink/cdbc] CDBC_FEEDBACK from {} — avail={}bps rx={}bps loss={:.1}% jitter={:.2}ms probe_result={}bps",
+                from,
+                fb.avail_bps,
+                fb.rx_bps,
+                fb.loss_pct,
+                fb.jitter_ms,
+                fb.probe_result_bps,
+            );
+
+            // Run the BW Governor state machine
+            let action = {
+                let mut gov = bw_gov.lock().unwrap();
+                gov.ingest(&fb)
+            };
+
+            eprintln!("[fluxsink/cdbc] BwGovernor → {:?}", action);
+
+            match action {
+                BwAction::SendProbe => {
+                    // Build and send a BANDWIDTH_PROBE datagram
+                    let dst = match *client_addr.lock().unwrap() {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("[fluxsink/cdbc] no client addr for probe");
+                            continue;
+                        }
+                    };
+                    let seq = probe_seq.fetch_add(1, Ordering::Relaxed);
+                    let probe = BandwidthProbe {
+                        ts_ns: now_ns(),
+                        probe_seq: seq,
+                        probe_size: 1200, // ~1 MTU of probe payload
+                    };
+                    let payload = serde_json::to_vec(&probe).unwrap_or_default();
+                    // Pad to probe_size so receiver can measure arrival bandwidth
+                    let mut padded = payload.clone();
+                    while padded.len() < probe.probe_size as usize {
+                        padded.push(0u8);
+                    }
+                    let probe_hdr = FluxHeader {
+                        version: flux_framing::FLUX_VERSION,
+                        frame_type: FrameType::BandwidthProbe,
+                        flags: 0,
+                        channel_id: 0,
+                        layer: 0,
+                        frag: 0,
+                        group_id: 0,
+                        group_timestamp_ns: now_ns(),
+                        presentation_ts: 0,
+                        capture_ts_ns_lo: 0,
+                        payload_length: padded.len() as u32,
+                        fec_group: 0,
+                        sequence_in_group: seq,
+                    };
+                    let mut pkt = Vec::with_capacity(HEADER_SIZE + padded.len());
+                    pkt.extend_from_slice(&probe_hdr.encode());
+                    pkt.extend_from_slice(&padded);
+                    let _ = sock.send_to(&pkt, dst);
+                    eprintln!(
+                        "[fluxsink/cdbc] BANDWIDTH_PROBE #{} → {} ({} bytes)",
+                        seq,
+                        dst,
+                        pkt.len()
+                    );
+                }
+                BwAction::AddLayer => {
+                    eprintln!("[fluxsink/cdbc] ACTION: add enhancement layer (bitrate headroom available)");
+                }
+                BwAction::DropLayer => {
+                    eprintln!("[fluxsink/cdbc] ACTION: drop top enhancement layer");
+                }
+                BwAction::EmergencyShed => {
+                    eprintln!("[fluxsink/cdbc] ACTION: EMERGENCY — shed enhancement layers + disable monitor");
+                }
+                BwAction::EnableFec => {
+                    eprintln!(
+                        "[fluxsink/cdbc] ACTION: enable XOR Row FEC on base layer (loss > 5%)"
+                    );
+                }
+                BwAction::EnableFecRS => {
+                    eprintln!("[fluxsink/cdbc] ACTION: enable Reed-Solomon 2D FEC + IDR-only (loss > 15%)");
+                }
+                BwAction::RecoveryRampUp => {
+                    eprintln!("[fluxsink/cdbc] ACTION: EMERGENCY recovery complete → RAMP_UP");
+                }
+                BwAction::Hold => {}
+            }
         }
     }
 
