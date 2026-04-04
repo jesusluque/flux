@@ -299,6 +299,9 @@ pub struct SessionRequest {
     pub sync_mode: String,
     pub ptp_mode: String,
     pub cdbc_interval_ms: u32,
+    /// UDP port the client is listening on for incoming media datagrams.
+    /// The server uses this to direct media instead of assuming a fixed port.
+    pub media_port: u16,
 }
 
 impl Default for SessionRequest {
@@ -314,6 +317,7 @@ impl Default for SessionRequest {
             sync_mode: "frame_sync".into(),
             ptp_mode: "software".into(),
             cdbc_interval_ms: 50,
+            media_port: 7402,
         }
     }
 }
@@ -459,5 +463,48 @@ mod tests {
             let ft = FrameType::from_u8(t).unwrap();
             assert_eq!(ft as u8, t);
         }
+    }
+
+    #[test]
+    fn session_request_roundtrip() {
+        let req = SessionRequest {
+            flux_version: "0.4".into(),
+            client_id: "test-client".into(),
+            crypto_mode: "crypto_none".into(),
+            codec_support: vec!["h265".into(), "av1".into()],
+            max_channels: 8,
+            max_layers: 2,
+            max_fps: 120,
+            sync_mode: "frame_sync".into(),
+            ptp_mode: "software".into(),
+            cdbc_interval_ms: 25,
+            media_port: 9000,
+        };
+        let json = serde_json::to_vec(&req).unwrap();
+        let back: SessionRequest = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.flux_version, req.flux_version);
+        assert_eq!(back.client_id, req.client_id);
+        assert_eq!(back.codec_support, req.codec_support);
+        assert_eq!(back.max_fps, req.max_fps);
+        assert_eq!(back.media_port, req.media_port);
+        assert_eq!(back.cdbc_interval_ms, req.cdbc_interval_ms);
+    }
+
+    #[test]
+    fn session_accept_roundtrip() {
+        let accept = SessionAccept {
+            flux_version: "0.4".into(),
+            session_id: "sess-1234567890-1".into(),
+            crypto_mode_ack: "crypto_none".into(),
+            keepalive_interval_ms: 500,
+            keepalive_timeout: 5,
+            max_datagram_size: 9000,
+        };
+        let json = serde_json::to_vec(&accept).unwrap();
+        let back: SessionAccept = serde_json::from_slice(&json).unwrap();
+        assert_eq!(back.session_id, accept.session_id);
+        assert_eq!(back.keepalive_interval_ms, accept.keepalive_interval_ms);
+        assert_eq!(back.keepalive_timeout, accept.keepalive_timeout);
+        assert_eq!(back.max_datagram_size, accept.max_datagram_size);
     }
 }

@@ -44,11 +44,12 @@ impl FluxSink {
 
 mod imp {
     use super::*;
-    use flux_framing::{SessionAccept, DEFAULT_PORT};
+    use flux_framing::{now_ns, SessionAccept, SessionRequest, DEFAULT_PORT};
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, UdpSocket};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
 
@@ -224,6 +225,9 @@ mod imp {
     }
 
     fn run_control_listener(addr: &str, client_store: Arc<Mutex<Option<SocketAddr>>>) {
+        /// Monotonically increasing session counter, shared across all connections.
+        static SESSION_COUNTER: AtomicU32 = AtomicU32::new(1);
+
         let listener = match TcpListener::bind(addr) {
             Ok(l) => l,
             Err(e) => {
@@ -233,16 +237,68 @@ mod imp {
         };
         for stream in listener.incoming().flatten() {
             let peer = stream.peer_addr().unwrap();
-            eprintln!("[fluxsink] SESSION from {}", peer);
-            let accept = SessionAccept::default();
-            let json = serde_json::to_vec(&accept).unwrap_or_default();
+            eprintln!("[fluxsink] SESSION TCP connect from {}", peer);
             let mut tcp = stream;
+
+            // ── Read SessionRequest ───────────────────────────────────────────
+            let req: SessionRequest = {
+                let mut len_buf = [0u8; 4];
+                if tcp.read_exact(&mut len_buf).is_err() {
+                    eprintln!(
+                        "[fluxsink] failed to read SessionRequest length from {}",
+                        peer
+                    );
+                    continue;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; len];
+                if tcp.read_exact(&mut body).is_err() {
+                    eprintln!(
+                        "[fluxsink] failed to read SessionRequest body from {}",
+                        peer
+                    );
+                    continue;
+                }
+                match serde_json::from_slice(&body) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        eprintln!("[fluxsink] malformed SessionRequest from {}: {}", peer, e);
+                        continue;
+                    }
+                }
+            };
+
+            eprintln!(
+                "[fluxsink] SESSION_REQUEST from {} — client_id={} codec={:?} max_fps={} cdbc_interval_ms={} media_port={}",
+                peer,
+                req.client_id,
+                req.codec_support,
+                req.max_fps,
+                req.cdbc_interval_ms,
+                req.media_port,
+            );
+
+            // ── Build and send SessionAccept ──────────────────────────────────
+            let counter = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let session_id = format!("sess-{}-{}", now_ns() / 1_000_000, counter);
+
+            let accept = SessionAccept {
+                session_id: session_id.clone(),
+                ..SessionAccept::default()
+            };
+            let json = serde_json::to_vec(&accept).unwrap_or_default();
             let _ = tcp.write_all(&(json.len() as u32).to_be_bytes());
             let _ = tcp.write_all(&json);
-            // Register the media return address (client sends datagrams from port 7402)
-            let media_addr: SocketAddr = format!("{}:7402", peer.ip()).parse().unwrap();
+
+            // ── Register client media address from negotiated port ────────────
+            let media_addr: SocketAddr =
+                format!("{}:{}", peer.ip(), req.media_port).parse().unwrap();
             *client_store.lock().unwrap() = Some(media_addr);
-            eprintln!("[fluxsink] client media addr = {}", media_addr);
+
+            eprintln!(
+                "[fluxsink] SESSION_ACCEPT sent — session_id={} client media addr={}",
+                session_id, media_addr
+            );
         }
     }
 }

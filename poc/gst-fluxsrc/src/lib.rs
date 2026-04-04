@@ -54,7 +54,8 @@ impl FluxSrc {
 
 mod imp {
     use flux_framing::{
-        now_ns, FluxHeader, KeepalivePayload, SessionRequest, DEFAULT_PORT, HEADER_SIZE,
+        now_ns, FluxHeader, KeepalivePayload, SessionAccept, SessionRequest, DEFAULT_PORT,
+        HEADER_SIZE,
     };
     use gst::glib;
     use gst::FlowError;
@@ -84,8 +85,14 @@ mod imp {
         server_udp: Option<SocketAddr>,
         session_id: String,
         keepalive_seq: u32,
-        last_ka: Instant,
+        last_ka_sent: Instant,
         ka_interval: Duration,
+        /// Number of consecutive missed server keepalives before session is dead.
+        /// 0 means timeout detection is disabled (server never sends keepalives yet).
+        ka_timeout_count: u32,
+        /// Last time we received *any* valid datagram from the server.
+        /// Used to detect session death when ka_timeout_count > 0.
+        last_rx: Instant,
         /// Fragment reassembly state (None = no in-progress AU)
         frag_assembly: Option<FragAssembly>,
     }
@@ -97,10 +104,12 @@ mod imp {
                 port: DEFAULT_PORT,
                 udp_sock: None,
                 server_udp: None,
-                session_id: "poc-session-001".into(),
+                session_id: String::new(),
                 keepalive_seq: 0,
-                last_ka: Instant::now(),
+                last_ka_sent: Instant::now(),
                 ka_interval: Duration::from_millis(1000),
+                ka_timeout_count: 0, // disabled until SESSION_ACCEPT received
+                last_rx: Instant::now(),
                 frag_assembly: None,
             }
         }
@@ -209,9 +218,11 @@ mod imp {
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             let mut s = self.inner.lock().unwrap();
 
-            // Bind local UDP socket for receiving media datagrams
-            let local_addr = "0.0.0.0:7402";
-            let sock = UdpSocket::bind(local_addr).map_err(|e| {
+            // ── Bind local UDP socket ─────────────────────────────────────────
+            // Use port advertised in SessionRequest (default 7402).
+            let req_defaults = SessionRequest::default();
+            let local_addr = format!("0.0.0.0:{}", req_defaults.media_port);
+            let sock = UdpSocket::bind(&local_addr).map_err(|e| {
                 gst::error_msg!(
                     gst::ResourceError::OpenRead,
                     ["bind UDP {}: {}", local_addr, e]
@@ -219,7 +230,6 @@ mod imp {
             })?;
             sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
 
-            // Store server UDP address (media port = port)
             let server_udp: SocketAddr =
                 format!("{}:{}", s.server_addr, s.port)
                     .parse()
@@ -232,32 +242,52 @@ mod imp {
 
             s.server_udp = Some(server_udp);
             s.udp_sock = Some(Arc::new(sock));
+            s.last_rx = Instant::now();
 
-            // TCP SESSION handshake on server control port (port + 1)
+            // ── TCP SESSION handshake ─────────────────────────────────────────
             let ctrl_addr = format!("{}:{}", s.server_addr, s.port + 1);
             match TcpStream::connect_timeout(&ctrl_addr.parse().unwrap(), Duration::from_secs(5)) {
                 Ok(mut tcp) => {
+                    // Send SessionRequest with our media_port
                     let req = SessionRequest::default();
                     let json = serde_json::to_vec(&req).unwrap();
                     let _ = tcp.write_all(&(json.len() as u32).to_be_bytes());
                     let _ = tcp.write_all(&json);
 
+                    // Read SessionAccept
                     let mut len_buf = [0u8; 4];
                     if tcp.read_exact(&mut len_buf).is_ok() {
                         let len = u32::from_be_bytes(len_buf) as usize;
                         let mut body = vec![0u8; len];
-                        let _ = tcp.read_exact(&mut body);
-                        gst::info!(
-                            gst::CAT_DEFAULT,
-                            "FluxSrc: SESSION_ACCEPT received ({} bytes)",
-                            len
-                        );
+                        if tcp.read_exact(&mut body).is_ok() {
+                            match serde_json::from_slice::<SessionAccept>(&body) {
+                                Ok(accept) => {
+                                    eprintln!(
+                                        "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout={}",
+                                        accept.session_id,
+                                        accept.keepalive_interval_ms,
+                                        accept.keepalive_timeout,
+                                    );
+                                    s.session_id = accept.session_id;
+                                    s.ka_interval =
+                                        Duration::from_millis(accept.keepalive_interval_ms as u64);
+                                    s.ka_timeout_count = accept.keepalive_timeout;
+                                }
+                                Err(e) => {
+                                    gst::warning!(
+                                        gst::CAT_DEFAULT,
+                                        "FluxSrc: malformed SESSION_ACCEPT: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(e) => {
                     gst::warning!(
                         gst::CAT_DEFAULT,
-                        "FluxSrc: TCP handshake to {} failed: {} (continuing)",
+                        "FluxSrc: TCP handshake to {} failed: {} (continuing without session)",
                         ctrl_addr,
                         e
                     );
@@ -266,9 +296,10 @@ mod imp {
 
             gst::info!(
                 gst::CAT_DEFAULT,
-                "FluxSrc: listening on {} for datagrams from {}",
+                "FluxSrc: listening on {} for datagrams from {} (session_id='{}')",
                 local_addr,
-                server_udp
+                server_udp,
+                s.session_id,
             );
             Ok(())
         }
@@ -295,8 +326,24 @@ mod imp {
                     let server_udp = s.server_udp;
                     let sid = s.session_id.clone();
 
-                    // Send KEEPALIVE if interval elapsed
-                    if s.last_ka.elapsed() >= s.ka_interval {
+                    // ── Session dead detection ────────────────────────────────
+                    // Only active after a successful SESSION_ACCEPT sets
+                    // ka_timeout_count > 0.
+                    if s.ka_timeout_count > 0 {
+                        let deadline = s.ka_interval.saturating_mul(s.ka_timeout_count);
+                        if s.last_rx.elapsed() > deadline {
+                            eprintln!(
+                                "[fluxsrc] session '{}' dead — no datagrams for {:?} (deadline {:?})",
+                                sid,
+                                s.last_rx.elapsed(),
+                                deadline,
+                            );
+                            return Err(FlowError::Eos);
+                        }
+                    }
+
+                    // ── Send KEEPALIVE if interval elapsed ────────────────────
+                    if s.last_ka_sent.elapsed() >= s.ka_interval {
                         if let Some(dst) = server_udp {
                             let ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
                             let ka_payload = KeepalivePayload {
@@ -310,22 +357,21 @@ mod imp {
                             pkt.extend_from_slice(&ka_json);
                             let _ = sock.send_to(&pkt, dst);
                             s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
-                            s.last_ka = Instant::now();
+                            s.last_ka_sent = Instant::now();
                         }
                     }
 
                     sock.clone()
                 };
 
-                // Blocking receive (with 500 ms timeout set in start())
+                // ── Blocking receive (500 ms timeout) ─────────────────────────
                 let (n, _from) = match sock_clone.recv_from(&mut recv_buf) {
                     Ok(v) => v,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             || e.kind() == std::io::ErrorKind::TimedOut =>
                     {
-                        // No packet yet — loop to retry (keepalive will be sent on
-                        // next iteration if the interval has elapsed).
+                        // Timeout — loop back to check keepalive / session dead.
                         continue;
                     }
                     Err(e) => {
@@ -334,9 +380,12 @@ mod imp {
                     }
                 };
 
+                // Update last-received timestamp on every valid datagram.
+                self.inner.lock().unwrap().last_rx = Instant::now();
+
                 let data = &recv_buf[..n];
 
-                // Parse the FLUX header to check fragment field
+                // ── Parse FLUX header ─────────────────────────────────────────
                 let hdr = match FluxHeader::decode(data) {
                     Some(h) => h,
                     None => continue, // malformed, skip
@@ -347,6 +396,7 @@ mod imp {
                 let seq = hdr.sequence_in_group;
                 eprintln!("[fluxsrc] rx {} bytes frag=0x{:X} seq={}", n, frag, seq);
 
+                // ── Fragment reassembly ───────────────────────────────────────
                 let complete: Option<Vec<u8>> = {
                     let mut s = self.inner.lock().unwrap();
 
@@ -359,7 +409,6 @@ mod imp {
                         if let Some(ref mut asm) = s.frag_assembly {
                             if asm.seq == seq {
                                 asm.data.extend_from_slice(payload);
-                                // Reassemble: prepend original header with frag=0
                                 let mut full = Vec::with_capacity(HEADER_SIZE + asm.data.len());
                                 let mut emit_hdr = hdr.clone();
                                 emit_hdr.frag = 0;
@@ -369,13 +418,12 @@ mod imp {
                                 s.frag_assembly = None;
                                 Some(full)
                             } else {
-                                // Sequence mismatch — stale, discard and start fresh
+                                // Stale sequence — discard
                                 s.frag_assembly = None;
                                 None
                             }
                         } else {
-                            // Last fragment with no open assembly — discard
-                            None
+                            None // last frag with no open assembly
                         }
                     } else {
                         // Intermediate fragment (frag 1..0xE)
@@ -384,7 +432,6 @@ mod imp {
                                 asm.data.extend_from_slice(payload);
                             }
                             _ => {
-                                // New AU or stale seq — start fresh
                                 s.frag_assembly = Some(FragAssembly {
                                     seq,
                                     data: payload.to_vec(),
@@ -405,7 +452,7 @@ mod imp {
                     }
                     return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
                 }
-                // else: loop again to receive the next fragment
+                // else: keep looping to receive the next fragment
             }
         }
     }
