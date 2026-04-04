@@ -371,6 +371,157 @@ pub struct KeepalivePayload {
     pub seq: u32,
 }
 
+// ─── FLUX-C upstream control (spec §12) ──────────────────────────────────────
+
+/// The `type` values carried inside a `FluxControl` JSON body (spec §12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlType {
+    /// PTZ move/zoom/focus command (spec §12.2).
+    Ptz,
+    /// Audio gain/mute per-channel (spec §12.3).
+    AudioMix,
+    /// Source routing redirect request (spec §7.3).
+    Routing,
+}
+
+/// FLUX-C upstream control datagram (spec §12).
+///
+/// Sent client → server as a `MetadataFrame (0xC)` datagram.
+/// The server is not required to acknowledge in the PoC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FluxControl {
+    /// Discriminant — which command this is.
+    #[serde(rename = "type")]
+    pub control_type: ControlType,
+    /// Wall-clock send time.
+    pub ts_ns: u64,
+    /// Session this command belongs to.
+    pub session_id: String,
+
+    // ── PTZ fields (all optional) ─────────────────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pan_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tilt_deg: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zoom_pos: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_pos: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f64>,
+
+    // ── AudioMix fields ───────────────────────────────────────────────────
+    /// Per-channel mute state  (index = channel id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mute: Option<Vec<bool>>,
+    /// Per-channel gain in dB  (index = channel id).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<Vec<f64>>,
+
+    // ── Routing fields ────────────────────────────────────────────────────
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+}
+
+impl FluxControl {
+    /// Build a PTZ command targeting `channel_id`.
+    pub fn ptz(
+        session_id: &str,
+        channel_id: u16,
+        pan_deg: f64,
+        tilt_deg: f64,
+        zoom_pos: f64,
+        focus_pos: f64,
+        speed: f64,
+    ) -> Self {
+        FluxControl {
+            control_type: ControlType::Ptz,
+            ts_ns: now_ns(),
+            session_id: session_id.into(),
+            channel_id: Some(channel_id),
+            pan_deg: Some(pan_deg),
+            tilt_deg: Some(tilt_deg),
+            zoom_pos: Some(zoom_pos),
+            focus_pos: Some(focus_pos),
+            speed: Some(speed),
+            mute: None,
+            gain_db: None,
+            target_id: None,
+        }
+    }
+
+    /// Build an audio-mix command (mute/unmute per channel).
+    pub fn audio_mix(session_id: &str, mute: Vec<bool>, gain_db: Vec<f64>) -> Self {
+        FluxControl {
+            control_type: ControlType::AudioMix,
+            ts_ns: now_ns(),
+            session_id: session_id.into(),
+            channel_id: None,
+            pan_deg: None,
+            tilt_deg: None,
+            zoom_pos: None,
+            focus_pos: None,
+            speed: None,
+            mute: Some(mute),
+            gain_db: Some(gain_db),
+            target_id: None,
+        }
+    }
+
+    /// Build a routing redirect request.
+    pub fn routing(session_id: &str, target_id: &str) -> Self {
+        FluxControl {
+            control_type: ControlType::Routing,
+            ts_ns: now_ns(),
+            session_id: session_id.into(),
+            channel_id: None,
+            pan_deg: None,
+            tilt_deg: None,
+            zoom_pos: None,
+            focus_pos: None,
+            speed: None,
+            mute: None,
+            gain_db: None,
+            target_id: Some(target_id.into()),
+        }
+    }
+
+    /// Encode this command into a complete FLUX datagram (header + JSON body).
+    ///
+    /// Uses `MetadataFrame (0xC)` as the frame type — the `type` field in the
+    /// JSON body distinguishes it from per-frame media metadata (spec §14).
+    pub fn encode_datagram(&self, seq: u32) -> Vec<u8> {
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        let hdr = FluxHeader {
+            version: FLUX_VERSION,
+            frame_type: FrameType::MetadataFrame,
+            flags: 0,
+            channel_id: self.channel_id.unwrap_or(0),
+            layer: 0,
+            frag: 0,
+            group_id: 0,
+            group_timestamp_ns: self.ts_ns,
+            presentation_ts: 0,
+            capture_ts_ns_lo: 0,
+            payload_length: body.len() as u32,
+            fec_group: 0,
+            sequence_in_group: seq,
+        };
+        let mut dg = Vec::with_capacity(HEADER_SIZE + body.len());
+        dg.extend_from_slice(&hdr.encode());
+        dg.extend_from_slice(&body);
+        dg
+    }
+
+    /// Try to parse a `FluxControl` from the body (everything after the 32-byte header).
+    pub fn decode_body(body: &[u8]) -> Option<Self> {
+        serde_json::from_slice(body).ok()
+    }
+}
+
 /// BANDWIDTH_PROBE payload (spec §5.3 / frame type 0xD)
 ///
 /// Sent server → client as a padded datagram; the client measures the

@@ -27,5 +27,6 @@ bytes      = "1"
 log        = "0.4"
 env_logger = "0.11"
 ctrlc      = "3"
+libc       = "0.2"
 
 flux-framing = { path = "../flux-framing" }

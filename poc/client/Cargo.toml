@@ -13,6 +13,7 @@ gstreamer-base  = { workspace = true }
 gstreamer-video = { workspace = true }
 gstreamer-app   = { workspace = true }
 flux-framing    = { path = "../flux-framing" }
+libc            = { workspace = true }
 env_logger      = { workspace = true }
 log             = { workspace = true }
 
