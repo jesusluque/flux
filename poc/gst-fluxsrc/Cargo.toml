@@ -12,4 +12,8 @@ gstreamer      = { workspace = true }
 gstreamer-base = { workspace = true }
 flux-framing   = { path = "../flux-framing" }
 serde_json     = { workspace = true }
+tokio          = { workspace = true }
+bytes          = { workspace = true }
 log            = { workspace = true }
+quinn          = { workspace = true }
+rustls         = { workspace = true }

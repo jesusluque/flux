@@ -2,12 +2,11 @@
 //!
 //! src: application/x-flux
 //!
-//! Connects to fluxsink via:
-//!   - TCP to server_addr:port+1 for SESSION handshake (crypto_none)
-//!   - UDP bind on :7402 to receive media datagrams
-//!   - Sends KEEPALIVE and CDBC_FEEDBACK back to server via UDP
-//!
-//! Each received UDP datagram is pushed as a GstBuffer downstream.
+//! Connects to fluxsink via QUIC (crypto_quic, spec §2.2):
+//!   - Opens a QUIC connection to server_addr:port
+//!   - SESSION handshake on QUIC Stream 0 (replaces old TCP :port+1)
+//!   - Media datagrams received via `connection.read_datagram()`
+//!   - KEEPALIVE and CDBC_FEEDBACK sent back via `connection.send_datagram()`
 //!
 //! Network simulation (NetSim)
 //! ───────────────────────────
@@ -17,9 +16,6 @@
 //!   sim-loss-pct   (f64, 0.0–100.0)  — random packet drop probability
 //!   sim-delay-ms   (u32, 0–500)      — artificial one-way latency (ms)
 //!   sim-bw-kbps    (u32, 0=off)      — token-bucket bandwidth cap (kbps)
-//!
-//! All three are writable GObject properties, so the client keyboard thread
-//! can adjust them at runtime via `element.set_property(...)`.
 
 use gst::glib;
 use gstreamer as gst;
@@ -78,23 +74,12 @@ mod imp {
     use gstreamer_base::subclass::prelude::*;
     use serde_json;
     use std::collections::BinaryHeap;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpStream, UdpSocket};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     // ─── NetSim ───────────────────────────────────────────────────────────────
 
-    /// Network-impairment simulation parameters.
-    ///
-    /// All fields are `AtomicU32` so the keyboard thread can write them without
-    /// taking `inner`'s mutex.
-    ///
-    /// Units:
-    ///   loss_pct_x100  — integer hundredths of a percent (0–10000; 500 = 5.00%)
-    ///   delay_ms       — milliseconds (0–500)
-    ///   bw_kbps        — kilobits/s (0 = unlimited)
     #[derive(Default)]
     struct NetSim {
         loss_pct_x100: AtomicU32, // 0–10000
@@ -102,8 +87,6 @@ mod imp {
         bw_kbps: AtomicU32,       // 0 = off
     }
 
-    /// One entry in the delay heap.
-    /// `Reverse` makes `BinaryHeap` a min-heap on release time.
     struct DelayEntry {
         release: Instant,
         data: Vec<u8>,
@@ -121,42 +104,36 @@ mod imp {
     }
     impl Ord for DelayEntry {
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            // min-heap: earlier release time = higher priority
-            other.release.cmp(&self.release)
+            other.release.cmp(&self.release) // min-heap
         }
     }
 
-    // ─── State ────────────────────────────────────────────────────────────────
+    // ─── Fragment reassembly ──────────────────────────────────────────────────
 
-    /// In-progress fragment reassembly buffer for one AU.
     struct FragAssembly {
         seq: u32,
         data: Vec<u8>,
     }
 
+    // ─── QUIC connection handle (shared between start() and the recv task) ────
+
     struct Inner {
         server_addr: String,
         port: u16,
-        udp_sock: Option<Arc<UdpSocket>>,
-        server_udp: Option<SocketAddr>,
+        /// QUIC connection, set after successful connect+handshake.
+        connection: Option<quinn::Connection>,
+        /// Tokio runtime, owned for the element's PLAYING lifetime.
+        rt: Option<tokio::runtime::Runtime>,
         session_id: String,
         keepalive_seq: u32,
         keepalives_sent: u64,
         last_ka_sent: Instant,
         ka_interval: Duration,
-        /// Number of consecutive missed server keepalives before session is dead.
-        /// 0 means timeout detection is disabled (server never sends keepalives yet).
         ka_timeout_count: u32,
-        /// Last time we received *any* valid datagram from the server.
-        /// Used to detect session death when ka_timeout_count > 0.
         last_rx: Instant,
-        /// Fragment reassembly state (None = no in-progress AU)
         frag_assembly: Option<FragAssembly>,
-
-        // ── NetSim token-bucket state ─────────────────────────────────────
-        /// Fractional byte tokens accumulated by the token bucket.
+        // NetSim token-bucket state
         tb_tokens: f64,
-        /// When tokens were last updated.
         tb_last: Instant,
     }
 
@@ -165,14 +142,14 @@ mod imp {
             Inner {
                 server_addr: "127.0.0.1".into(),
                 port: DEFAULT_PORT,
-                udp_sock: None,
-                server_udp: None,
+                connection: None,
+                rt: None,
                 session_id: String::new(),
                 keepalive_seq: 0,
                 keepalives_sent: 0,
                 last_ka_sent: Instant::now(),
                 ka_interval: Duration::from_millis(1000),
-                ka_timeout_count: 0, // disabled until SESSION_ACCEPT received
+                ka_timeout_count: 0,
                 last_rx: Instant::now(),
                 frag_assembly: None,
                 tb_tokens: 0.0,
@@ -185,29 +162,33 @@ mod imp {
 
     pub struct FluxSrc {
         inner: Mutex<Inner>,
-        /// Shared network-simulation parameters (written by keyboard thread,
-        /// read by create() and delay thread).
         netsim: Arc<NetSim>,
-        /// Datagrams that have passed BW throttle and loss check are pushed
-        /// here (possibly after a delay).  `create()` reads from the receiver.
+        /// Datagrams received from QUIC, after BW throttle + loss, pushed here.
         delayed_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
         delayed_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>,
         /// Shared delay heap + condvar for the delay thread.
         delay_heap: Arc<(Mutex<BinaryHeap<DelayEntry>>, Condvar)>,
-        /// Set to true when stop() is called so the delay thread exits.
+        /// Stop flag for the delay thread (and recv task).
         stop_flag: Arc<AtomicU32>,
+        /// Raw datagrams from the QUIC recv task → NetSim pipeline.
+        /// The recv task pushes here; create() reads and applies NetSim.
+        raw_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>,
+        raw_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
     }
 
     impl Default for FluxSrc {
         fn default() -> Self {
-            let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+            let (dtx, drx) = std::sync::mpsc::sync_channel(1024);
+            let (rtx, rrx) = std::sync::mpsc::sync_channel(1024);
             FluxSrc {
                 inner: Mutex::new(Inner::default()),
                 netsim: Arc::new(NetSim::default()),
-                delayed_tx: Mutex::new(Some(tx)),
-                delayed_rx: Mutex::new(Some(rx)),
+                delayed_tx: Mutex::new(Some(dtx)),
+                delayed_rx: Mutex::new(Some(drx)),
                 delay_heap: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
                 stop_flag: Arc::new(AtomicU32::new(0)),
+                raw_rx: Mutex::new(Some(rrx)),
+                raw_tx: Mutex::new(Some(rtx)),
             }
         }
     }
@@ -222,8 +203,6 @@ mod imp {
     impl ObjectImpl for FluxSrc {
         fn constructed(&self) {
             self.parent_constructed();
-            // Mark as a live source so the pipeline transitions to PLAYING without
-            // waiting for a preroll buffer (live sources don't block in PAUSED).
             use gstreamer_base::prelude::BaseSrcExt;
             self.obj().set_live(true);
         }
@@ -239,10 +218,9 @@ mod imp {
                         .build(),
                     glib::ParamSpecUInt::builder("port")
                         .nick("Port")
-                        .blurb("FLUX server media port (default 7400)")
+                        .blurb("FLUX server QUIC port (default 7400)")
                         .default_value(DEFAULT_PORT as u32)
                         .build(),
-                    // ── Read-only session stats ───────────────────────────────
                     glib::ParamSpecString::builder("session-id")
                         .nick("Session ID")
                         .blurb("Negotiated session ID (set after SESSION_ACCEPT)")
@@ -263,7 +241,6 @@ mod imp {
                         .blurb("Total KEEPALIVE datagrams sent to the server")
                         .read_only()
                         .build(),
-                    // ── NetSim writable properties ────────────────────────────
                     glib::ParamSpecDouble::builder("sim-loss-pct")
                         .nick("Sim loss %")
                         .blurb("Random packet loss probability (0.0–100.0 %)")
@@ -305,8 +282,6 @@ mod imp {
                 "sim-bw-kbps" => {
                     let kbps: u32 = value.get().unwrap();
                     self.netsim.bw_kbps.store(kbps, Ordering::Relaxed);
-                    // Reset token bucket so a sudden cap doesn't cause a
-                    // huge burst of accumulated tokens.
                     self.inner.lock().unwrap().tb_tokens = 0.0;
                 }
                 _ => {}
@@ -344,7 +319,7 @@ mod imp {
                 gst::subclass::ElementMetadata::new(
                     "FLUX Source",
                     "Source/Network/FLUX",
-                    "Receives FLUX frames over UDP (crypto_none client)",
+                    "Receives FLUX frames over QUIC datagrams (crypto_quic client)",
                     "LUCAB Media Technology",
                 )
             }))
@@ -375,21 +350,56 @@ mod imp {
         }
 
         fn start(&self) -> Result<(), gst::ErrorMessage> {
+            self.stop_flag.store(0, Ordering::Relaxed);
+
             let mut s = self.inner.lock().unwrap();
 
-            // ── Bind local UDP socket ─────────────────────────────────────────
-            // Use port advertised in SessionRequest (default 7402).
-            let req_defaults = SessionRequest::default();
-            let local_addr = format!("0.0.0.0:{}", req_defaults.media_port);
-            let sock = UdpSocket::bind(&local_addr).map_err(|e| {
-                gst::error_msg!(
-                    gst::ResourceError::OpenRead,
-                    ["bind UDP {}: {}", local_addr, e]
-                )
-            })?;
-            sock.set_read_timeout(Some(Duration::from_millis(500))).ok();
+            // ── Tokio runtime ────────────────────────────────────────────────
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| {
+                    gst::error_msg!(gst::ResourceError::Failed, ["tokio runtime: {}", e])
+                })?;
 
-            let server_udp: SocketAddr =
+            // ── Build QUIC client endpoint with skip-verify TLS ──────────────
+            // PoC trust model: equivalent to the old crypto_none.
+            // We accept any server cert (no PKI, ephemeral self-signed).
+            let tls_cfg = rustls::ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(SkipVerify::new()))
+                .with_no_client_auth();
+
+            let quic_client_crypto =
+                quinn::crypto::rustls::QuicClientConfig::try_from(tls_cfg).map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::Failed,
+                        ["quinn client crypto: {}", e]
+                    )
+                })?;
+
+            let mut transport = quinn::TransportConfig::default();
+            transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+            transport.keep_alive_interval(Some(Duration::from_secs(5)));
+
+            let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
+            client_cfg.transport_config(Arc::new(transport));
+
+            // quinn::Endpoint::client() requires an active Tokio context.
+            let _rt_guard = rt.enter();
+
+            let mut endpoint =
+                quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::OpenRead,
+                        ["QUIC client endpoint: {}", e]
+                    )
+                })?;
+            endpoint.set_default_client_config(client_cfg);
+
+            // ── Connect to server ────────────────────────────────────────────
+            let server_addr: std::net::SocketAddr =
                 format!("{}:{}", s.server_addr, s.port)
                     .parse()
                     .map_err(|e| {
@@ -399,99 +409,121 @@ mod imp {
                         )
                     })?;
 
-            s.server_udp = Some(server_udp);
-            s.udp_sock = Some(Arc::new(sock));
-            s.last_rx = Instant::now();
+            let connection = rt
+                .block_on(async {
+                    let connecting = endpoint
+                        .connect(server_addr, "localhost")
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    connecting.await.map_err(|e| std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e.to_string()))
+                })
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::OpenRead,
+                        ["QUIC connect to {}: {}", server_addr, e]
+                    )
+                })?;
 
-            // ── TCP SESSION handshake ─────────────────────────────────────────
-            let ctrl_addr = format!("{}:{}", s.server_addr, s.port + 1);
-            match TcpStream::connect_timeout(&ctrl_addr.parse().unwrap(), Duration::from_secs(5)) {
-                Ok(mut tcp) => {
-                    // Send SessionRequest with our media_port
-                    let req = SessionRequest::default();
-                    let json = serde_json::to_vec(&req).unwrap();
-                    let _ = tcp.write_all(&(json.len() as u32).to_be_bytes());
-                    let _ = tcp.write_all(&json);
-
-                    // Read SessionAccept
-                    let mut len_buf = [0u8; 4];
-                    if tcp.read_exact(&mut len_buf).is_ok() {
-                        let len = u32::from_be_bytes(len_buf) as usize;
-                        let mut body = vec![0u8; len];
-                        if tcp.read_exact(&mut body).is_ok() {
-                            match serde_json::from_slice::<SessionAccept>(&body) {
-                                Ok(accept) => {
-                                    eprintln!(
-                                        "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout={}",
-                                        accept.session_id,
-                                        accept.keepalive_interval_ms,
-                                        accept.keepalive_timeout,
-                                    );
-                                    s.session_id = accept.session_id;
-                                    s.ka_interval =
-                                        Duration::from_millis(accept.keepalive_interval_ms as u64);
-                                    s.ka_timeout_count = accept.keepalive_timeout;
-                                }
-                                Err(e) => {
-                                    gst::warning!(
-                                        gst::CAT_DEFAULT,
-                                        "FluxSrc: malformed SESSION_ACCEPT: {}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    gst::warning!(
-                        gst::CAT_DEFAULT,
-                        "FluxSrc: TCP handshake to {} failed: {} (continuing without session)",
-                        ctrl_addr,
-                        e
-                    );
-                }
-            }
-
-            gst::info!(
-                gst::CAT_DEFAULT,
-                "FluxSrc: listening on {} for datagrams from {} (session_id='{}')",
-                local_addr,
-                server_udp,
-                s.session_id,
+            eprintln!(
+                "[fluxsrc] QUIC connected to {} (crypto_quic)",
+                connection.remote_address()
             );
 
+            // ── SESSION handshake on Stream 0 ────────────────────────────────
+            let (mut send, mut recv) = rt
+                .block_on(async { connection.open_bi().await })
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::OpenRead,
+                        ["open bidi stream: {}", e]
+                    )
+                })?;
+
+            let req = SessionRequest::default();
+            let json: Vec<u8> = serde_json::to_vec(&req).unwrap();
+            let mut msg: Vec<u8> = Vec::with_capacity(4 + json.len());
+            msg.extend_from_slice(&(json.len() as u32).to_be_bytes());
+            msg.extend_from_slice(&json);
+            rt.block_on(async { send.write_all(&msg).await })
+                .map_err(|e| {
+                    gst::error_msg!(
+                        gst::ResourceError::OpenRead,
+                        ["write SessionRequest: {}", e]
+                    )
+                })?;
+
+            // Read SessionAccept
+            let accept: Option<SessionAccept> = rt.block_on(async {
+                let mut len_buf = [0u8; 4];
+                if recv_exact(&mut recv, &mut len_buf).await.is_err() {
+                    return None;
+                }
+                let len = u32::from_be_bytes(len_buf) as usize;
+                let mut body = vec![0u8; len];
+                if recv_exact(&mut recv, &mut body).await.is_err() {
+                    return None;
+                }
+                serde_json::from_slice::<SessionAccept>(&body).ok()
+            });
+
+            if let Some(ref a) = accept {
+                eprintln!(
+                    "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout={}",
+                    a.session_id, a.keepalive_interval_ms, a.keepalive_timeout,
+                );
+                s.session_id = a.session_id.clone();
+                s.ka_interval = Duration::from_millis(a.keepalive_interval_ms as u64);
+                s.ka_timeout_count = a.keepalive_timeout;
+            } else {
+                gst::warning!(
+                    gst::CAT_DEFAULT,
+                    "FluxSrc: no SESSION_ACCEPT received (continuing without session)"
+                );
+            }
+
+            s.last_rx = Instant::now();
+            s.last_ka_sent = Instant::now();
+            s.connection = Some(connection.clone());
+
+            // ── Spawn QUIC datagram recv task ─────────────────────────────────
+            // Pulls raw datagrams and forwards them to `raw_tx` channel.
+            // create() reads from `raw_rx`, applies NetSim, then pushes downstream.
+            let raw_tx = self.raw_tx.lock().unwrap().clone();
+            let stop_flag = self.stop_flag.clone();
+            if let Some(raw_tx) = raw_tx {
+                let conn_for_recv = connection.clone();
+                rt.spawn(async move {
+                    run_recv_task(conn_for_recv, raw_tx, stop_flag).await;
+                });
+            }
+
             // ── Spawn delay thread ────────────────────────────────────────────
-            // The delay thread owns a copy of the delay heap and the mpsc sender.
-            // It wakes whenever a new entry is pushed or an existing one is due.
-            drop(s); // release the mutex before spawning
+            drop(s); // release mutex before spawning threads
 
             let heap_pair = Arc::clone(&self.delay_heap);
-            let stop_flag = Arc::clone(&self.stop_flag);
-            let tx = self.delayed_tx.lock().unwrap().clone();
-
-            if let Some(tx) = tx {
+            let stop_flag2 = Arc::clone(&self.stop_flag);
+            let dtx = self.delayed_tx.lock().unwrap().clone();
+            if let Some(dtx) = dtx {
                 std::thread::Builder::new()
                     .name("fluxsrc-delay".into())
-                    .spawn(move || {
-                        run_delay_thread(heap_pair, tx, stop_flag);
-                    })
+                    .spawn(move || run_delay_thread(heap_pair, dtx, stop_flag2))
                     .ok();
             }
+
+            self.inner.lock().unwrap().rt = Some(rt);
 
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
-            // Signal the delay thread to exit.
             self.stop_flag.store(1, Ordering::Relaxed);
-            // Wake the delay thread if it is sleeping on the condvar.
             let (_heap, cvar) = &*self.delay_heap;
             cvar.notify_all();
 
             let mut s = self.inner.lock().unwrap();
-            s.udp_sock = None;
-            s.server_udp = None;
+            if let Some(conn) = s.connection.take() {
+                conn.close(quinn::VarInt::from_u32(0), b"stopped");
+            }
+            s.rt = None;
             Ok(())
         }
     }
@@ -501,108 +533,89 @@ mod imp {
             &self,
             _buf: Option<&mut gst::BufferRef>,
         ) -> Result<gst_base::subclass::base_src::CreateSuccess, FlowError> {
-            let mut recv_buf = vec![0u8; 65536];
-
             loop {
-                // ── Pull from delayed channel (non-blocking first) ─────────────
-                //
-                // If a datagram was previously enqueued in the delay heap and is
-                // now due, the delay thread will have placed it in `delayed_rx`.
-                // We try to drain it here before going back to the socket.
+                // ── Drain delayed channel (non-blocking) ──────────────────────
                 {
                     if let Some(rx) = self.delayed_rx.lock().unwrap().as_ref() {
-                        // Non-blocking try_recv.
                         while let Ok(data) = rx.try_recv() {
                             if let Some(buf) = self.push_data(data)? {
-                                return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
-                                    buf,
-                                ));
+                                return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
                             }
                         }
                     }
                 }
 
                 // ── Keepalive + session-dead check ────────────────────────────
-                let sock_clone = {
+                {
                     let mut s = self.inner.lock().unwrap();
-                    let sock = s.udp_sock.as_ref().ok_or(FlowError::Error)?.clone();
-                    let server_udp = s.server_udp;
-                    let sid = s.session_id.clone();
 
                     if s.ka_timeout_count > 0 {
                         let deadline = s.ka_interval.saturating_mul(s.ka_timeout_count);
                         if s.last_rx.elapsed() > deadline {
                             eprintln!(
-                                "[fluxsrc] session '{}' dead — no datagrams for {:?} (deadline {:?})",
-                                sid,
-                                s.last_rx.elapsed(),
-                                deadline,
+                                "[fluxsrc] session '{}' dead — no datagrams for {:?}",
+                                s.session_id,
+                                s.last_rx.elapsed()
                             );
                             return Err(FlowError::Eos);
                         }
                     }
 
                     if s.last_ka_sent.elapsed() >= s.ka_interval {
-                        if let Some(dst) = server_udp {
+                        if let Some(ref conn) = s.connection.clone() {
+                            let sid = s.session_id.clone();
                             let ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
                             let ka_payload = KeepalivePayload {
                                 ts_ns: now_ns(),
-                                session_id: sid.clone(),
+                                session_id: sid,
                                 seq: s.keepalive_seq,
                             };
                             let ka_json = serde_json::to_vec(&ka_payload).unwrap();
                             let mut pkt = Vec::with_capacity(HEADER_SIZE + ka_json.len());
                             pkt.extend_from_slice(&ka_hdr.encode());
                             pkt.extend_from_slice(&ka_json);
-                            let _ = sock.send_to(&pkt, dst);
+                            let bytes = bytes::Bytes::from(pkt);
+                            let _ = conn.send_datagram(bytes);
                             s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
                             s.keepalives_sent += 1;
                             s.last_ka_sent = Instant::now();
                         }
                     }
+                }
 
-                    sock.clone()
-                };
-
-                // ── Blocking receive (500 ms timeout) ─────────────────────────
-                let (n, _from) = match sock_clone.recv_from(&mut recv_buf) {
-                    Ok(v) => v,
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
+                // ── Receive raw datagram (500 ms timeout) ─────────────────────
+                let raw = {
+                    match self
+                        .raw_rx
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
                     {
-                        // Timeout — loop back to check keepalive / session dead.
-                        // Also drain delayed channel on timeout.
-                        if let Some(rx) = self.delayed_rx.lock().unwrap().as_ref() {
-                            while let Ok(data) = rx.try_recv() {
-                                if let Some(buf) = self.push_data(data)? {
-                                    return Ok(
-                                        gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf),
-                                    );
+                        Some(d) => d,
+                        None => {
+                            // Timeout — loop back to check keepalive / session dead.
+                            // Also drain delayed channel.
+                            if let Some(rx) = self.delayed_rx.lock().unwrap().as_ref() {
+                                while let Ok(data) = rx.try_recv() {
+                                    if let Some(buf) = self.push_data(data)? {
+                                        return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
+                                    }
                                 }
                             }
+                            continue;
                         }
-                        continue;
-                    }
-                    Err(e) => {
-                        gst::warning!(gst::CAT_DEFAULT, "UDP recv error: {}", e);
-                        return Err(FlowError::Error);
                     }
                 };
 
-                // Update last-received timestamp on every valid datagram.
+                // Update last-received timestamp.
                 self.inner.lock().unwrap().last_rx = Instant::now();
-
-                let raw = recv_buf[..n].to_vec();
 
                 // ── NetSim: random loss ───────────────────────────────────────
                 let loss_x100 = self.netsim.loss_pct_x100.load(Ordering::Relaxed);
                 if loss_x100 > 0 {
-                    // LCG-based pseudo-random — no rand crate needed.
-                    // Range 0–9999 inclusive.
                     let r = lcg_rand() % 10000;
                     if r < loss_x100 {
-                        // Drop this datagram.
                         continue;
                     }
                 }
@@ -610,27 +623,24 @@ mod imp {
                 // ── NetSim: token-bucket BW throttle ─────────────────────────
                 let bw_kbps = self.netsim.bw_kbps.load(Ordering::Relaxed);
                 if bw_kbps > 0 {
-                    let byte_rate = (bw_kbps as f64) * 1000.0 / 8.0; // bytes/sec
+                    let byte_rate = (bw_kbps as f64) * 1000.0 / 8.0;
                     let datagram_bytes = raw.len() as f64;
                     loop {
-                        let elapsed = {
+                        let tokens = {
                             let mut s = self.inner.lock().unwrap();
                             let e = s.tb_last.elapsed().as_secs_f64();
                             s.tb_tokens += e * byte_rate;
-                            // Cap at one datagram-max worth of burst (65536 bytes)
                             if s.tb_tokens > 65536.0 {
                                 s.tb_tokens = 65536.0;
                             }
                             s.tb_last = Instant::now();
                             s.tb_tokens
                         };
-                        if elapsed >= datagram_bytes {
+                        if tokens >= datagram_bytes {
                             self.inner.lock().unwrap().tb_tokens -= datagram_bytes;
                             break;
                         }
-                        // Not enough tokens — sleep for the time it takes to
-                        // accumulate enough tokens for this datagram.
-                        let deficit = datagram_bytes - elapsed;
+                        let deficit = datagram_bytes - tokens;
                         let wait_secs = deficit / byte_rate;
                         std::thread::sleep(Duration::from_secs_f64(wait_secs.min(0.1)));
                     }
@@ -639,7 +649,6 @@ mod imp {
                 // ── NetSim: artificial delay ──────────────────────────────────
                 let delay_ms = self.netsim.delay_ms.load(Ordering::Relaxed);
                 if delay_ms > 0 {
-                    // Push into delay heap; the delay thread will release it.
                     let release = Instant::now() + Duration::from_millis(delay_ms as u64);
                     let entry = DelayEntry { release, data: raw };
                     let (heap_lock, cvar) = &*self.delay_heap;
@@ -648,13 +657,10 @@ mod imp {
                         heap.push(entry);
                     }
                     cvar.notify_one();
-                    // Try to pull any already-due packets before going back to recv.
                     if let Some(rx) = self.delayed_rx.lock().unwrap().as_ref() {
                         while let Ok(data) = rx.try_recv() {
                             if let Some(buf) = self.push_data(data)? {
-                                return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(
-                                    buf,
-                                ));
+                                return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
                             }
                         }
                     }
@@ -665,22 +671,43 @@ mod imp {
                 if let Some(buf) = self.push_data(raw)? {
                     return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
                 }
-                // else: fragment not yet complete — keep looping
             }
         }
     }
 
-    // ─── Fragment reassembly (shared between direct path and delayed path) ───
+    // ─── QUIC recv task ───────────────────────────────────────────────────────
+
+    async fn run_recv_task(
+        conn: quinn::Connection,
+        tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+        stop_flag: Arc<AtomicU32>,
+    ) {
+        loop {
+            if stop_flag.load(Ordering::Relaxed) != 0 {
+                break;
+            }
+            match conn.read_datagram().await {
+                Ok(dg) => {
+                    if tx.try_send(dg.to_vec()).is_err() {
+                        break; // receiver gone
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[fluxsrc/recv] read_datagram error: {}", e);
+                    break;
+                }
+            }
+        }
+    }
+
+    // ─── Fragment reassembly ──────────────────────────────────────────────────
 
     impl FluxSrc {
-        /// Parse `data` as a FLUX datagram and run it through fragment reassembly.
-        /// Returns `Some(GstBuffer)` when a complete AU is ready, `None` otherwise.
         fn push_data(&self, data: Vec<u8>) -> Result<Option<gst::Buffer>, FlowError> {
             let n = data.len();
-
             let hdr = match FluxHeader::decode(&data) {
                 Some(h) => h,
-                None => return Ok(None), // malformed, skip
+                None => return Ok(None),
             };
 
             let payload = &data[HEADER_SIZE..];
@@ -752,8 +779,6 @@ mod imp {
 
     // ─── Delay thread ─────────────────────────────────────────────────────────
 
-    /// Background thread: monitors the delay heap and forwards entries to the
-    /// mpsc channel once their release time has arrived.
     fn run_delay_thread(
         heap_pair: Arc<(Mutex<BinaryHeap<DelayEntry>>, Condvar)>,
         tx: std::sync::mpsc::SyncSender<Vec<u8>>,
@@ -770,32 +795,26 @@ mod imp {
                 if let Some(top) = heap.peek() {
                     let now = Instant::now();
                     if top.release <= now {
-                        // Ready immediately — don't wait.
                         Duration::ZERO
                     } else {
                         top.release - now
                     }
                 } else {
-                    // No entries; wait up to 100 ms for a push.
                     Duration::from_millis(100)
                 }
             };
 
             if wait_dur > Duration::ZERO {
-                // Sleep until the next entry is due (or woken by a push).
                 let heap = heap_lock.lock().unwrap();
                 let _guard = cvar.wait_timeout(heap, wait_dur).unwrap();
-                // (We re-check the heap each iteration regardless of why we woke.)
                 continue;
             }
 
-            // Pop all entries that are now due.
             let mut heap = heap_lock.lock().unwrap();
             let now = Instant::now();
             while let Some(top) = heap.peek() {
                 if top.release <= now {
                     let entry = heap.pop().unwrap();
-                    // Best-effort send; if the receiver is gone, exit.
                     if tx.try_send(entry.data).is_err() {
                         return;
                     }
@@ -806,9 +825,91 @@ mod imp {
         }
     }
 
-    // ─── Simple LCG pseudo-random (no rand crate) ────────────────────────────
+    // ─── Skip-verify TLS (PoC) ────────────────────────────────────────────────
 
-    /// Thread-local LCG state for fast, dependency-free random u32 generation.
+    #[derive(Debug)]
+    struct SkipVerify(Arc<rustls::crypto::CryptoProvider>);
+
+    impl SkipVerify {
+        fn new() -> Self {
+            Self(Arc::new(rustls::crypto::ring::default_provider()))
+        }
+    }
+
+    impl rustls::client::danger::ServerCertVerifier for SkipVerify {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    // ─── recv_exact helper ────────────────────────────────────────────────────
+
+    async fn recv_exact(
+        recv: &mut quinn::RecvStream,
+        buf: &mut [u8],
+    ) -> Result<(), std::io::Error> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match recv.read(&mut buf[filled..]).await {
+                Ok(Some(n)) => filled += n,
+                Ok(None) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "stream closed",
+                    ))
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ─── LCG pseudo-random ────────────────────────────────────────────────────
+
     fn lcg_rand() -> u32 {
         use std::cell::Cell;
         thread_local! {

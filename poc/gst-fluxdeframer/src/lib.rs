@@ -4,6 +4,16 @@
 //!
 //! The server forces h265parse to output byte-stream (SPS/PPS inlined), so the
 //! payload in every FLUX MediaData frame is a self-contained byte-stream AU.
+//!
+//! When QUIC path MTU forces fragmentation (frag field 0x1..0xF), this element
+//! accumulates all fragments for one AU (same sequence_in_group) and pushes the
+//! reassembled payload only when the last fragment (frag=0xF) arrives.
+//! Unfragmented datagrams (frag=0x0) are pushed immediately.
+//!
+//! Implementation note: fragment reassembly requires allocating a buffer whose
+//! size is only known after all fragments arrive.  We use the
+//! `submit_input_buffer` + `generate_output` pattern (rather than `transform`)
+//! so we control output buffer allocation.
 
 use gst::glib;
 use gstreamer as gst;
@@ -47,10 +57,48 @@ mod imp {
     use super::*;
     use flux_framing::{reconstruct_capture_ts, FluxHeader, FrameType, FLUX_VERSION, HEADER_SIZE};
     use gst::subclass::prelude::*;
+    use gst_base::subclass::base_transform::GenerateOutputSuccess;
     use gst_base::subclass::prelude::*;
+    use std::sync::Mutex;
+
+    // ── Fragment reassembly state ─────────────────────────────────────────────
+
+    struct FragState {
+        /// sequence_in_group of the AU being assembled (None = idle).
+        seq: Option<u32>,
+        /// Accumulated payload bytes from all received fragments.
+        payload: Vec<u8>,
+        /// Header from the first fragment (carries timestamps, flags).
+        hdr: Option<FluxHeader>,
+        /// A fully reassembled AU ready to be pushed, or None.
+        ready: Option<(Vec<u8>, FluxHeader)>,
+    }
+
+    impl Default for FragState {
+        fn default() -> Self {
+            FragState {
+                seq: None,
+                payload: Vec::new(),
+                hdr: None,
+                ready: None,
+            }
+        }
+    }
+
+    impl FragState {
+        fn reset_assembly(&mut self) {
+            self.seq = None;
+            self.payload.clear();
+            self.hdr = None;
+        }
+    }
+
+    // ── Element ───────────────────────────────────────────────────────────────
 
     #[derive(Default)]
-    pub struct FluxDeframer;
+    pub struct FluxDeframer {
+        state: Mutex<FragState>,
+    }
 
     #[glib::object_subclass]
     impl ObjectSubclass for FluxDeframer {
@@ -70,7 +118,7 @@ mod imp {
                 gst::subclass::ElementMetadata::new(
                     "FLUX Deframer",
                     "Transform/Network/FLUX",
-                    "Strips the 32-byte FLUX header and emits raw H.265",
+                    "Strips FLUX header, reassembles QUIC fragments, emits raw H.265",
                     "LUCAB Media Technology",
                 )
             }))
@@ -108,31 +156,34 @@ mod imp {
         const PASSTHROUGH_ON_SAME_CAPS: bool = false;
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = false;
 
-        fn transform(
+        /// Called for every incoming buffer.  We accumulate fragment state here.
+        /// Returns `BASE_TRANSFORM_FLOW_DROPPED` while still accumulating, or
+        /// `FlowSuccess::Ok` when a complete AU has been placed in `state.ready`
+        /// (which causes GStreamer to call `generate_output`).
+        fn submit_input_buffer(
             &self,
-            inbuf: &gst::Buffer,
-            outbuf: &mut gst::BufferRef,
+            is_discont: bool,
+            inbuf: gst::Buffer,
         ) -> Result<gst::FlowSuccess, gst::FlowError> {
-            let map_in = inbuf.map_readable().map_err(|_| gst::FlowError::Error)?;
-            let data = map_in.as_slice();
+            let _ = is_discont;
+
+            let map = inbuf.map_readable().map_err(|_| gst::FlowError::Error)?;
+            let data = map.as_slice();
 
             if data.len() < HEADER_SIZE {
-                return Err(gst::FlowError::Error);
+                // Too short — discard silently
+                return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
             }
 
-            let hdr = FluxHeader::decode(data).ok_or(gst::FlowError::Error)?;
+            let hdr = match FluxHeader::decode(data) {
+                Some(h) if h.version == FLUX_VERSION => h,
+                _ => return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED),
+            };
 
-            if hdr.version != FLUX_VERSION {
-                return Err(gst::FlowError::Error);
+            // Non-media frames are discarded (keepalive etc. handled upstream)
+            if hdr.frame_type != FrameType::MediaData {
+                return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
             }
-
-            match hdr.frame_type {
-                FrameType::MediaData => {}
-                _ => return Ok(gst::FlowSuccess::Ok),
-            }
-
-            let full_capture_ns =
-                reconstruct_capture_ts(hdr.group_timestamp_ns, hdr.capture_ts_ns_lo);
 
             // Skip optional metadata block (spec §4.4)
             let payload_start = if hdr.has_metadata() && data.len() >= HEADER_SIZE + 2 {
@@ -143,38 +194,105 @@ mod imp {
                 HEADER_SIZE
             };
 
-            let h265_data = &data[payload_start..];
+            let chunk = &data[payload_start..];
 
-            // Restore timestamps
-            let pts = gst::ClockTime::from_nseconds(
-                (hdr.presentation_ts as u64) * (1_000_000_000 / 90_000),
-            );
-            outbuf.set_pts(pts);
-            outbuf.set_dts(gst::ClockTime::from_nseconds(full_capture_ns));
+            let mut st = self.state.lock().unwrap();
 
-            if !hdr.is_keyframe() {
-                outbuf.set_flags(gst::BufferFlags::DELTA_UNIT);
+            match hdr.frag {
+                0x0 => {
+                    // Unfragmented — emit immediately
+                    if st.seq.is_some() {
+                        eprintln!(
+                            "[fluxdeframer] unfragmented seq={} arrived while seq={:?} in progress — discarding old",
+                            hdr.sequence_in_group, st.seq
+                        );
+                        st.reset_assembly();
+                    }
+                    st.ready = Some((chunk.to_vec(), hdr));
+                }
+                0xF => {
+                    // Last fragment
+                    if st.seq != Some(hdr.sequence_in_group) {
+                        eprintln!(
+                            "[fluxdeframer] last-frag seq={} but assembling={:?} — discarding",
+                            hdr.sequence_in_group, st.seq
+                        );
+                        st.reset_assembly();
+                        return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+                    }
+                    st.payload.extend_from_slice(chunk);
+                    let payload = std::mem::take(&mut st.payload);
+                    let first_hdr = st.hdr.take().unwrap();
+                    st.reset_assembly();
+                    st.ready = Some((payload, first_hdr));
+                }
+                n => {
+                    // Middle / first fragment (0x1..0xE)
+                    if n == 1 || st.seq.is_none() {
+                        if st.seq.is_some() && st.seq != Some(hdr.sequence_in_group) {
+                            eprintln!(
+                                "[fluxdeframer] new seq={} while seq={:?} incomplete — discarding old",
+                                hdr.sequence_in_group, st.seq
+                            );
+                        }
+                        st.reset_assembly();
+                        st.seq = Some(hdr.sequence_in_group);
+                        st.hdr = Some(hdr.clone());
+                    } else if st.seq != Some(hdr.sequence_in_group) {
+                        eprintln!(
+                            "[fluxdeframer] mid-frag seq={} != assembling={:?} — discarding",
+                            hdr.sequence_in_group, st.seq
+                        );
+                        st.reset_assembly();
+                        return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+                    }
+                    st.payload.extend_from_slice(chunk);
+                    // Not ready yet — signal no output needed
+                    return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+                }
             }
 
-            let mut map_out = outbuf.map_writable().map_err(|_| gst::FlowError::Error)?;
-            map_out[..h265_data.len()].copy_from_slice(h265_data);
-            drop(map_out);
-            // Resize to actual payload (may be smaller than transform_size allocated)
-            outbuf.set_size(h265_data.len());
+            // AU is ready — tell GStreamer to call generate_output()
             Ok(gst::FlowSuccess::Ok)
         }
 
-        fn transform_size(
-            &self,
-            direction: gst::PadDirection,
-            _caps: &gst::Caps,
-            size: usize,
-            _othercaps: &gst::Caps,
-        ) -> Option<usize> {
-            match direction {
-                gst::PadDirection::Sink => Some(size.saturating_sub(HEADER_SIZE)),
-                _ => Some(size + HEADER_SIZE),
+        /// Called after `submit_input_buffer` returned `Buffer`.  At this point
+        /// `state.ready` holds the fully reassembled AU; allocate a new buffer
+        /// of exactly the right size and fill it.
+        fn generate_output(&self) -> Result<GenerateOutputSuccess, gst::FlowError> {
+            let (payload, hdr) = {
+                let mut st = self.state.lock().unwrap();
+                match st.ready.take() {
+                    Some(pair) => pair,
+                    None => {
+                        return Ok(GenerateOutputSuccess::NoOutput);
+                    }
+                }
+            };
+
+            let full_capture_ns =
+                reconstruct_capture_ts(hdr.group_timestamp_ns, hdr.capture_ts_ns_lo);
+
+            let pts = gst::ClockTime::from_nseconds(
+                (hdr.presentation_ts as u64) * (1_000_000_000 / 90_000),
+            );
+
+            let mut outbuf =
+                gst::Buffer::with_size(payload.len()).map_err(|_| gst::FlowError::Error)?;
+            {
+                let outbuf_ref = outbuf.get_mut().ok_or(gst::FlowError::Error)?;
+                outbuf_ref.set_pts(pts);
+                outbuf_ref.set_dts(gst::ClockTime::from_nseconds(full_capture_ns));
+                if !hdr.is_keyframe() {
+                    outbuf_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
+                }
+                let mut map = outbuf_ref
+                    .map_writable()
+                    .map_err(|_| gst::FlowError::Error)?;
+                map.copy_from_slice(&payload);
             }
+
+            Ok(GenerateOutputSuccess::Buffer(outbuf))
         }
 
         fn transform_caps(

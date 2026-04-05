@@ -29,4 +29,8 @@ env_logger = "0.11"
 ctrlc      = "3"
 libc       = "0.2"
 
+quinn  = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rcgen  = "0.13"
+
 flux-framing = { path = "../flux-framing" }

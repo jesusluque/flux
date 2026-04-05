@@ -203,7 +203,7 @@ fn run(tty: Option<Tty>) {
     pipeline
         .set_state(gst::State::Playing)
         .expect("Unable to start pipeline");
-    eprintln!("[flux-client] Pipeline started — waiting for FLUX stream on :7400");
+    eprintln!("[flux-client] Pipeline started — waiting for FLUX stream on :7400 (QUIC)");
     print_help();
 
     let main_loop = glib::MainLoop::new(None, false);

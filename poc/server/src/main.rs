@@ -111,11 +111,15 @@ fn main() {
         .expect("fluxframer → fluxsink");
 
     // ── Run ───────────────────────────────────────────────────────────────────
-    pipeline
-        .set_state(gst::State::Playing)
-        .expect("Unable to start pipeline");
+    match pipeline.set_state(gst::State::Playing) {
+        Ok(s) => eprintln!("[flux-server] set_state(Playing) → {:?}", s),
+        Err(e) => eprintln!(
+            "[flux-server] set_state(Playing) failed: {:?} — waiting for bus error",
+            e
+        ),
+    }
     eprintln!(
-        "[flux-server] Pipeline started — encoding H.265 and sending FLUX datagrams on :7400"
+        "[flux-server] Pipeline started — encoding H.265 and sending FLUX datagrams on :7400 (QUIC)"
     );
 
     // Install Ctrl-C handler: send EOS so the pipeline shuts down cleanly.
