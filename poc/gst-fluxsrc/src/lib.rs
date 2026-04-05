@@ -56,14 +56,22 @@ impl FluxSrc {
             Self::static_type(),
         )
     }
+
+    /// Send a pre-encoded FLUX datagram to the server over the live QUIC
+    /// connection.  Returns `true` if the datagram was queued successfully,
+    /// `false` if there is no active connection or the send failed.
+    pub fn send_datagram(&self, data: Vec<u8>) -> bool {
+        use gstreamer::subclass::prelude::ObjectSubclassExt;
+        imp::FluxSrc::from_obj(self).send_datagram_inner(bytes::Bytes::from(data))
+    }
 }
 
 // ─── Implementation submodule ─────────────────────────────────────────────────
 
 mod imp {
     use flux_framing::{
-        now_ns, FluxHeader, KeepalivePayload, SessionAccept, SessionRequest, DEFAULT_PORT,
-        HEADER_SIZE,
+        now_ns, FluxHeader, KeepalivePayload, SessionAccept, SessionRequest, StreamAnnounce,
+        DEFAULT_PORT, HEADER_SIZE,
     };
     use gst::glib;
     use gst::FlowError;
@@ -108,13 +116,6 @@ mod imp {
         }
     }
 
-    // ─── Fragment reassembly ──────────────────────────────────────────────────
-
-    struct FragAssembly {
-        seq: u32,
-        data: Vec<u8>,
-    }
-
     // ─── QUIC connection handle (shared between start() and the recv task) ────
 
     struct Inner {
@@ -131,10 +132,23 @@ mod imp {
         ka_interval: Duration,
         ka_timeout_count: u32,
         last_rx: Instant,
-        frag_assembly: Option<FragAssembly>,
+        /// False until the first datagram is received on this session.
+        /// The session-dead timeout clock is not started until this is true,
+        /// so the pipeline can stay in Paused for arbitrarily long without
+        /// triggering a spurious EOS.
+        first_rx_seen: bool,
         // NetSim token-bucket state
         tb_tokens: f64,
         tb_last: Instant,
+        /// Fix 3: Set to true at the start of every new session so the very
+        /// first downstream buffer carries BUFFER_FLAG_DISCONT, telling
+        /// h265parse to flush its GOP state and vtdec_hw to reset.
+        pending_discont: bool,
+        /// When the pipeline is paused, record the moment we entered Paused so
+        /// that on resume we can advance last_rx and last_ka_sent by the pause
+        /// duration, keeping the session-dead and keepalive clocks frozen while
+        /// the pipeline is not running.
+        paused_at: Option<Instant>,
     }
 
     impl Default for Inner {
@@ -151,9 +165,11 @@ mod imp {
                 ka_interval: Duration::from_millis(1000),
                 ka_timeout_count: 0,
                 last_rx: Instant::now(),
-                frag_assembly: None,
+                first_rx_seen: false,
                 tb_tokens: 0.0,
                 tb_last: Instant::now(),
+                pending_discont: false,
+                paused_at: None,
             }
         }
     }
@@ -172,7 +188,15 @@ mod imp {
         stop_flag: Arc<AtomicU32>,
         /// Raw datagrams from the QUIC recv task → NetSim pipeline.
         /// The recv task pushes here; create() reads and applies NetSim.
-        raw_rx: Mutex<Option<std::sync::mpsc::Receiver<Vec<u8>>>>,
+        ///
+        /// A2/A5: `raw_rx` is wrapped in `Arc<Mutex<Receiver>>`. `create()`
+        /// clones the `Arc` (briefly locking `raw_rx_slot`) and then calls
+        /// `recv_timeout()` while holding only the inner `Mutex<Receiver>` —
+        /// not the outer slot lock.  On restart, `start()` creates a fresh
+        /// channel pair and stores the new receiver by replacing the slot,
+        /// which solves the A5 stale-channel problem that `OnceLock` could
+        /// not handle (it cannot be reset after first set).
+        raw_rx_slot: Mutex<Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>>,
         raw_tx: Mutex<Option<std::sync::mpsc::SyncSender<Vec<u8>>>>,
     }
 
@@ -187,7 +211,7 @@ mod imp {
                 delayed_rx: Mutex::new(Some(drx)),
                 delay_heap: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
                 stop_flag: Arc::new(AtomicU32::new(0)),
-                raw_rx: Mutex::new(Some(rrx)),
+                raw_rx_slot: Mutex::new(Arc::new(Mutex::new(rrx))),
                 raw_tx: Mutex::new(Some(rtx)),
             }
         }
@@ -338,6 +362,30 @@ mod imp {
                 .unwrap()]
             })
         }
+
+        fn change_state(
+            &self,
+            transition: gst::StateChange,
+        ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+            match transition {
+                gst::StateChange::PlayingToPaused => {
+                    // Freeze the session-dead and keepalive clocks while paused.
+                    self.inner.lock().unwrap().paused_at = Some(Instant::now());
+                }
+                gst::StateChange::PausedToPlaying => {
+                    // Advance last_rx and last_ka_sent by the time spent paused
+                    // so the timers behave as if time did not pass.
+                    let mut s = self.inner.lock().unwrap();
+                    if let Some(at) = s.paused_at.take() {
+                        let frozen = at.elapsed();
+                        s.last_rx += frozen;
+                        s.last_ka_sent += frozen;
+                    }
+                }
+                _ => {}
+            }
+            self.parent_change_state(transition)
+        }
     }
 
     impl BaseSrcImpl for FluxSrc {
@@ -380,7 +428,7 @@ mod imp {
                 })?;
 
             let mut transport = quinn::TransportConfig::default();
-            transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+            transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
             transport.keep_alive_interval(Some(Duration::from_secs(5)));
 
             let mut client_cfg = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
@@ -467,12 +515,12 @@ mod imp {
 
             if let Some(ref a) = accept {
                 eprintln!(
-                    "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout={}",
-                    a.session_id, a.keepalive_interval_ms, a.keepalive_timeout,
+                    "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout_count={}",
+                    a.session_id, a.keepalive_interval_ms, a.keepalive_timeout_count,
                 );
                 s.session_id = a.session_id.clone();
                 s.ka_interval = Duration::from_millis(a.keepalive_interval_ms as u64);
-                s.ka_timeout_count = a.keepalive_timeout;
+                s.ka_timeout_count = a.keepalive_timeout_count;
             } else {
                 gst::warning!(
                     gst::CAT_DEFAULT,
@@ -482,7 +530,19 @@ mod imp {
 
             s.last_rx = Instant::now();
             s.last_ka_sent = Instant::now();
+            s.first_rx_seen = false;
             s.connection = Some(connection.clone());
+            // Fix 3: Mark that the next buffer pushed downstream is the start
+            // of a fresh session and must carry BUFFER_FLAG_DISCONT.
+            s.pending_discont = true;
+
+            // ── A5: Fresh raw channel on every start() ───────────────────────
+            // Replace the raw_rx slot with a new receiver so that any stale
+            // datagrams from a previous session are discarded and the old
+            // sender (held by the previous recv task) is disconnected.
+            let (rtx, rrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(1024);
+            *self.raw_rx_slot.lock().unwrap() = Arc::new(Mutex::new(rrx));
+            *self.raw_tx.lock().unwrap() = Some(rtx);
 
             // ── Spawn QUIC datagram recv task ─────────────────────────────────
             // Pulls raw datagrams and forwards them to `raw_tx` channel.
@@ -495,6 +555,19 @@ mod imp {
                     run_recv_task(conn_for_recv, raw_tx, stop_flag).await;
                 });
             }
+
+             // ── Spawn uni-stream listener task ────────────────────────────────
+             // Receives all server-opened unidirectional streams: STREAM_ANNOUNCE
+             // frames (M1) and, now, one-stream-per-AU media data frames.  The
+             // media frames are forwarded to raw_tx so create() delivers them to
+             // the GStreamer pipeline.
+             {
+                 let conn_for_uni = connection.clone();
+                 let uni_raw_tx = self.raw_tx.lock().unwrap().clone();
+                 rt.spawn(async move {
+                     run_stream_announce_listener(conn_for_uni, uni_raw_tx).await;
+                 });
+             }
 
             // ── Spawn delay thread ────────────────────────────────────────────
             drop(s); // release mutex before spawning threads
@@ -549,7 +622,11 @@ mod imp {
                 {
                     let mut s = self.inner.lock().unwrap();
 
-                    if s.ka_timeout_count > 0 {
+                    // Only check for session death after we have received at
+                    // least one datagram.  Before that, last_rx is set to the
+                    // start() timestamp, so the timeout would fire spuriously
+                    // while the pipeline is still in Paused (pre-roll).
+                    if s.first_rx_seen && s.ka_timeout_count > 0 {
                         let deadline = s.ka_interval.saturating_mul(s.ka_timeout_count);
                         if s.last_rx.elapsed() > deadline {
                             eprintln!(
@@ -579,21 +656,27 @@ mod imp {
                             s.keepalive_seq = s.keepalive_seq.wrapping_add(1);
                             s.keepalives_sent += 1;
                             s.last_ka_sent = Instant::now();
+                            // The QUIC connection is alive as long as we can
+                            // send.  Reset last_rx so the session-dead timer
+                            // does not fire during windows where the server
+                            // sends nothing (e.g. while awaiting an IDR).
+                            s.last_rx = Instant::now();
+                            s.first_rx_seen = true;
                         }
                     }
                 }
 
                 // ── Receive raw datagram (500 ms timeout) ─────────────────────
+                // A2/A5: Clone the Arc<Mutex<Receiver>> while briefly locking
+                // the slot, then release the slot lock before calling
+                // recv_timeout — so property reads from other threads are never
+                // blocked for up to 500 ms.
                 let raw = {
-                    match self
-                        .raw_rx
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|rx| rx.recv_timeout(Duration::from_millis(500)).ok())
-                    {
-                        Some(d) => d,
-                        None => {
+                    let rx_arc = self.raw_rx_slot.lock().unwrap().clone();
+                    let guard = rx_arc.lock().unwrap();
+                    match guard.recv_timeout(Duration::from_millis(500)) {
+                        Ok(d) => d,
+                        Err(_) => {
                             // Timeout — loop back to check keepalive / session dead.
                             // Also drain delayed channel.
                             if let Some(rx) = self.delayed_rx.lock().unwrap().as_ref() {
@@ -608,8 +691,12 @@ mod imp {
                     }
                 };
 
-                // Update last-received timestamp.
-                self.inner.lock().unwrap().last_rx = Instant::now();
+                // Update last-received timestamp and arm the session-dead clock.
+                {
+                    let mut s = self.inner.lock().unwrap();
+                    s.last_rx = Instant::now();
+                    s.first_rx_seen = true;
+                }
 
                 // ── NetSim: random loss ───────────────────────────────────────
                 let loss_x100 = self.netsim.loss_pct_x100.load(Ordering::Relaxed);
@@ -621,28 +708,41 @@ mod imp {
                 }
 
                 // ── NetSim: token-bucket BW throttle ─────────────────────────
+                // A3: When the token bucket is exhausted, we push the datagram
+                // onto the delay heap with its computed release time rather than
+                // calling std::thread::sleep() on the GStreamer source thread.
+                // Sleeping here caused pipeline clock drift under congestion.
                 let bw_kbps = self.netsim.bw_kbps.load(Ordering::Relaxed);
                 if bw_kbps > 0 {
                     let byte_rate = (bw_kbps as f64) * 1000.0 / 8.0;
                     let datagram_bytes = raw.len() as f64;
-                    loop {
-                        let tokens = {
-                            let mut s = self.inner.lock().unwrap();
-                            let e = s.tb_last.elapsed().as_secs_f64();
-                            s.tb_tokens += e * byte_rate;
-                            if s.tb_tokens > 65536.0 {
-                                s.tb_tokens = 65536.0;
-                            }
-                            s.tb_last = Instant::now();
-                            s.tb_tokens
-                        };
-                        if tokens >= datagram_bytes {
-                            self.inner.lock().unwrap().tb_tokens -= datagram_bytes;
-                            break;
+                    let (enough_tokens, wait_secs) = {
+                        let mut s = self.inner.lock().unwrap();
+                        let e = s.tb_last.elapsed().as_secs_f64();
+                        s.tb_tokens += e * byte_rate;
+                        if s.tb_tokens > 65536.0 {
+                            s.tb_tokens = 65536.0;
                         }
-                        let deficit = datagram_bytes - tokens;
-                        let wait_secs = deficit / byte_rate;
-                        std::thread::sleep(Duration::from_secs_f64(wait_secs.min(0.1)));
+                        s.tb_last = Instant::now();
+                        if s.tb_tokens >= datagram_bytes {
+                            s.tb_tokens -= datagram_bytes;
+                            (true, 0.0)
+                        } else {
+                            let deficit = datagram_bytes - s.tb_tokens;
+                            (false, (deficit / byte_rate).min(0.5))
+                        }
+                    };
+                    if !enough_tokens {
+                        // Defer via delay heap — avoids blocking the source thread.
+                        let release = Instant::now() + Duration::from_secs_f64(wait_secs);
+                        let entry = DelayEntry { release, data: raw };
+                        let (heap_lock, cvar) = &*self.delay_heap;
+                        {
+                            let mut heap = heap_lock.lock().unwrap();
+                            heap.push(entry);
+                        }
+                        cvar.notify_one();
+                        continue;
                     }
                 }
 
@@ -670,6 +770,99 @@ mod imp {
                 // ── No delay: process immediately ─────────────────────────────
                 if let Some(buf) = self.push_data(raw)? {
                     return Ok(gst_base::subclass::base_src::CreateSuccess::NewBuffer(buf));
+                }
+            }
+        }
+    }
+
+    // ─── STREAM_ANNOUNCE listener / media stream receiver ────────────────────
+
+    /// Receives all incoming unidirectional QUIC streams from the server.
+    ///
+    /// Each stream carries exactly one FLUX frame (FLUX_HEADER + payload).
+    /// Frame types handled:
+    ///   - `MediaData`      → forwarded to `raw_tx` for the GStreamer pipeline
+    ///   - `StreamAnnounce` → logged (M1 / spec §3.1)
+    ///   - everything else  → ignored with a log line
+    async fn run_stream_announce_listener(
+        conn: quinn::Connection,
+        raw_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    ) {
+        loop {
+            let mut recv = match conn.accept_uni().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[fluxsrc/uni] accept_uni error: {}", e);
+                    break;
+                }
+            };
+
+            // Read all bytes from the unidirectional stream.
+            let mut data = Vec::new();
+            let mut chunk_buf = [0u8; 65536];
+            loop {
+                match recv.read(&mut chunk_buf).await {
+                    Ok(Some(n)) => data.extend_from_slice(&chunk_buf[..n]),
+                    Ok(None) => break, // stream finished (EOF)
+                    Err(e) => {
+                        eprintln!("[fluxsrc/uni] read error on uni stream: {}", e);
+                        break;
+                    }
+                }
+            }
+
+            if data.len() < HEADER_SIZE {
+                eprintln!(
+                    "[fluxsrc/uni] uni stream too short ({} bytes) — skipping",
+                    data.len()
+                );
+                continue;
+            }
+
+            let hdr = match FluxHeader::decode(&data) {
+                Some(h) => h,
+                None => {
+                    eprintln!("[fluxsrc/uni] could not decode FLUX header — skipping");
+                    continue;
+                }
+            };
+
+            let payload = &data[HEADER_SIZE..];
+
+            match hdr.frame_type {
+                flux_framing::FrameType::MediaData => {
+                    if hdr.is_keyframe() {
+                        eprintln!(
+                            "[fluxsrc/uni] MediaData keyframe=true group_ts_ns={} len={}",
+                            hdr.group_timestamp_ns, data.len()
+                        );
+                    }
+                    // Forward to the GStreamer pipeline via raw_tx.
+                    if let Some(ref tx) = raw_tx {
+                        if tx.try_send(data).is_err() {
+                            eprintln!("[fluxsrc/uni] raw_tx full or closed — frame dropped");
+                        }
+                    }
+                }
+                flux_framing::FrameType::StreamAnnounce => {
+                    match serde_json::from_slice::<StreamAnnounce>(payload) {
+                        Ok(sa) => {
+                            eprintln!(
+                                "[fluxsrc] STREAM_ANNOUNCE — ch={} layer={} codec={} name={:?} rate={} res={}",
+                                sa.channel_id, sa.layer_id, sa.codec, sa.name,
+                                sa.frame_rate, sa.resolution,
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("[fluxsrc] malformed STREAM_ANNOUNCE payload: {}", e);
+                        }
+                    }
+                }
+                other => {
+                    eprintln!(
+                        "[fluxsrc/uni] unexpected frame type {:?} on uni stream — ignoring",
+                        other
+                    );
                 }
             }
         }
@@ -703,77 +896,47 @@ mod imp {
     // ─── Fragment reassembly ──────────────────────────────────────────────────
 
     impl FluxSrc {
+        /// Send a pre-encoded datagram over the live QUIC connection.
+        pub(super) fn send_datagram_inner(&self, bytes: bytes::Bytes) -> bool {
+            let conn = self.inner.lock().unwrap().connection.clone();
+            match conn {
+                Some(c) => c.send_datagram(bytes).is_ok(),
+                None => false,
+            }
+        }
+
+        /// Wrap a raw QUIC datagram in a GStreamer buffer and pass it downstream.
+        ///
+        /// Fragment reassembly is intentionally NOT performed here.  The
+        /// `fluxdeframer` element downstream owns reassembly; doing it in two
+        /// places simultaneously (B6) caused race conditions and dead code.
         fn push_data(&self, data: Vec<u8>) -> Result<Option<gst::Buffer>, FlowError> {
-            let n = data.len();
-            let hdr = match FluxHeader::decode(&data) {
-                Some(h) => h,
-                None => return Ok(None),
-            };
-
-            let payload = &data[HEADER_SIZE..];
-            let frag = hdr.frag;
-            let seq = hdr.sequence_in_group;
-            gst::trace!(
-                gst::CAT_DEFAULT,
-                "rx {} bytes frag=0x{:X} seq={}",
-                n,
-                frag,
-                seq
-            );
-
-            let complete: Option<Vec<u8>> = {
-                let mut s = self.inner.lock().unwrap();
-
-                if frag == 0x0 {
-                    s.frag_assembly = None;
-                    Some(data)
-                } else if frag == 0xF {
-                    if let Some(ref mut asm) = s.frag_assembly {
-                        if asm.seq == seq {
-                            asm.data.extend_from_slice(payload);
-                            let mut full = Vec::with_capacity(HEADER_SIZE + asm.data.len());
-                            let mut emit_hdr = hdr.clone();
-                            emit_hdr.frag = 0;
-                            emit_hdr.payload_length = asm.data.len() as u32;
-                            full.extend_from_slice(&emit_hdr.encode());
-                            full.extend_from_slice(&asm.data);
-                            s.frag_assembly = None;
-                            Some(full)
-                        } else {
-                            s.frag_assembly = None;
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                } else {
-                    match s.frag_assembly {
-                        Some(ref mut asm) if asm.seq == seq => {
-                            asm.data.extend_from_slice(payload);
-                        }
-                        _ => {
-                            s.frag_assembly = Some(FragAssembly {
-                                seq,
-                                data: payload.to_vec(),
-                            });
-                        }
-                    }
-                    None
-                }
-            };
-
-            if let Some(full_data) = complete {
-                let len = full_data.len();
-                let mut buf = gst::Buffer::with_size(len).map_err(|_| FlowError::Error)?;
-                {
-                    let buf_ref = buf.get_mut().unwrap();
-                    let mut map = buf_ref.map_writable().map_err(|_| FlowError::Error)?;
-                    map[..len].copy_from_slice(&full_data);
-                }
-                return Ok(Some(buf));
+            if FluxHeader::decode(&data).is_none() {
+                return Ok(None); // discard undecodable datagrams silently
             }
 
-            Ok(None)
+            let len = data.len();
+            let mut buf = gst::Buffer::with_size(len).map_err(|_| FlowError::Error)?;
+            {
+                let buf_ref = buf.get_mut().unwrap();
+
+                // Fix 3: Stamp DISCONT on the very first buffer of each new
+                // session so fluxdeframer → h265parse → vtdec_hw know the
+                // reference picture chain has been reset.
+                let discont = {
+                    let mut s = self.inner.lock().unwrap();
+                    let d = s.pending_discont;
+                    s.pending_discont = false;
+                    d
+                };
+                if discont {
+                    buf_ref.set_flags(gst::BufferFlags::DISCONT);
+                }
+
+                let mut map = buf_ref.map_writable().map_err(|_| FlowError::Error)?;
+                map[..len].copy_from_slice(&data);
+            }
+            Ok(Some(buf))
         }
     }
 

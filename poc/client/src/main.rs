@@ -34,7 +34,6 @@ use glib::ControlFlow;
 use gst::glib;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +71,11 @@ fn run(tty: Option<Tty>) {
         .property("address", "127.0.0.1")
         .property("port", 7400u32)
         .build()
-        .expect("fluxsrc element");
+        .expect("fluxsrc element")
+        .downcast::<gstfluxsrc::FluxSrc>()
+        .expect("fluxsrc downcast to FluxSrc");
+    // Keep a base-class reference for APIs that take &gst::Element.
+    let fluxsrc_elem: &gst::Element = fluxsrc.upcast_ref();
 
     let fluxdemux = gst::ElementFactory::make("fluxdemux")
         .build()
@@ -122,7 +125,7 @@ fn run(tty: Option<Tty>) {
 
     pipeline
         .add_many([
-            &fluxsrc,
+            fluxsrc_elem,
             &fluxdemux,
             &fluxdeframer,
             &h265parse,
@@ -134,7 +137,7 @@ fn run(tty: Option<Tty>) {
         ])
         .expect("add elements");
 
-    fluxsrc.link(&fluxdemux).expect("fluxsrc → fluxdemux");
+    fluxsrc_elem.link(&fluxdemux).expect("fluxsrc → fluxdemux");
     // fluxcdbc is passthrough — it observes raw FLUX frames and sends CDBC_FEEDBACK.
     // Wire it in-line on media_0: fluxcdbc → fluxdeframer → h265parse → ...
     fluxcdbc
@@ -261,12 +264,14 @@ fn run(tty: Option<Tty>) {
     //    all internally thread-safe and need no main-thread dispatch.
 
     let audio_muted = Arc::new(AtomicBool::new(false));
+    let is_playing = Arc::new(AtomicBool::new(true)); // pipeline starts in Playing
     let ctrl_seq = Arc::new(Mutex::new(0u32));
-    // Cycle through a curated list of videotestsrc pattern ids.
-    // 0=smpte 1=snow 2=black 11=circular 13=smpte75 18=ball 24=colors
-    // Start at 1 so the first T press immediately moves off the server's
-    // default pattern (smpte=0) to something visibly different.
-    const PATTERNS: &[u32] = &[0, 1, 2, 11, 13, 18, 24];
+    // Cycle through all videotestsrc pattern ids in order.
+    // Start at 1 so the first T press moves off the server's default (smpte=0).
+    const PATTERNS: &[u32] = &[
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25,
+    ];
     let pattern_idx = Arc::new(AtomicU32::new(1));
     let fps_overlay_on = Arc::new(AtomicBool::new(true));
 
@@ -276,6 +281,7 @@ fn run(tty: Option<Tty>) {
         let fluxcdbc_ctl = fluxcdbc.clone();
         let main_loop_ctl = main_loop.clone();
         let audio_muted = audio_muted.clone();
+        let is_playing = is_playing.clone();
         let ctrl_seq = ctrl_seq.clone();
         let pattern_idx = pattern_idx.clone();
         let fps_overlay_on = fps_overlay_on.clone();
@@ -305,12 +311,13 @@ fn run(tty: Option<Tty>) {
 
                 match key {
                     b' ' => {
-                        // Use a short finite timeout — NONE blocks forever on macOS
-                        // because the state query is serviced by the GLib main loop
-                        // which is on the same thread as run() (macos-gst-thread),
-                        // causing a deadlock when called from the keyboard thread.
-                        let (_, cur, _) = pipeline_ctl.state(gst::ClockTime::from_mseconds(100));
-                        if cur == gst::State::Playing {
+                        // Toggle playing/paused using a local AtomicBool rather
+                        // than querying pipeline state — the state query blocks
+                        // up to 100 ms and on macOS returns a stale value because
+                        // the GLib main loop (same thread as run()) services the
+                        // query, causing a consistent false-Paused result.
+                        let was_playing = is_playing.fetch_xor(true, Ordering::Relaxed);
+                        if was_playing {
                             pipeline_ctl.set_state(gst::State::Paused).ok();
                             eprintln!("[flux-client] PAUSED");
                         } else {
@@ -323,11 +330,12 @@ fn run(tty: Option<Tty>) {
                         main_loop_ctl.quit();
                         break;
                     }
-                    b's' | b'S' => print_stats(&fluxsrc_ctl, &fluxcdbc_ctl),
+                    b's' | b'S' => print_stats(fluxsrc_ctl.upcast_ref(), &fluxcdbc_ctl),
                     b'p' | b'P' => {
                         send_flux_c(
                             flux_framing::FluxControl::ptz(&session_id, 0, 0.0, 0.0, 0.5, 0.5, 1.0),
                             &ctrl_seq,
+                            &fluxsrc_ctl,
                         );
                         eprintln!("[flux-client] FLUX-C PTZ sent");
                     }
@@ -342,6 +350,7 @@ fn run(tty: Option<Tty>) {
                                 vec![gain],
                             ),
                             &ctrl_seq,
+                            &fluxsrc_ctl,
                         );
                         eprintln!(
                             "[flux-client] audio ch0 -> {}",
@@ -361,6 +370,7 @@ fn run(tty: Option<Tty>) {
                             send_flux_c(
                                 flux_framing::FluxControl::routing(&session_id, "current"),
                                 &ctrl_seq,
+                                &fluxsrc_ctl,
                             );
                         }
                     }
@@ -382,6 +392,7 @@ fn run(tty: Option<Tty>) {
                             send_flux_c(
                                 flux_framing::FluxControl::test_pattern(&session_id, pat_id),
                                 &ctrl_seq,
+                                &fluxsrc_ctl,
                             );
                             eprintln!("[flux-client] FLUX-C test_pattern → {}", pat_id);
                         }
@@ -454,7 +465,7 @@ fn print_help() {
     eprintln!("  R     — show routing / session info");
     eprintln!("  D     — toggle fps overlay on video window");
     eprintln!(
-        "  T     — cycle server test pattern via FLUX-C (smpte→snow→black→circular→smpte75→ball→colors)"
+        "  T     — cycle server test pattern via FLUX-C (0=smpte … 25=smpte-rp-219, wraps around)"
     );
     eprintln!("  L/l   — NetSim packet loss  +5% / -5%  (clamped 0–100%)");
     eprintln!("  Y/y   — NetSim delay       +20ms / -20ms  (clamped 0–500 ms)");
@@ -515,8 +526,13 @@ fn print_stats(fluxsrc: &gst::Element, fluxcdbc: &gst::Element) {
     eprintln!();
 }
 
-/// Send a `FluxControl` command as a UDP datagram to the server media port.
-fn send_flux_c(cmd: flux_framing::FluxControl, seq_store: &Arc<Mutex<u32>>) {
+/// Send a `FluxControl` command as a QUIC datagram to the server via the
+/// live fluxsrc connection.  Falls back to a no-op if not yet connected.
+fn send_flux_c(
+    cmd: flux_framing::FluxControl,
+    seq_store: &Arc<Mutex<u32>>,
+    fluxsrc: &gstfluxsrc::FluxSrc,
+) {
     let seq = {
         let mut s = seq_store.lock().unwrap();
         let v = *s;
@@ -524,9 +540,8 @@ fn send_flux_c(cmd: flux_framing::FluxControl, seq_store: &Arc<Mutex<u32>>) {
         v
     };
     let datagram = cmd.encode_datagram(seq);
-    // Best-effort send; bind an ephemeral socket for this one datagram.
-    if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
-        let _ = sock.send_to(&datagram, "127.0.0.1:7400");
+    if !fluxsrc.send_datagram(datagram) {
+        eprintln!("[flux-client] send_flux_c: no active QUIC connection — dropped");
     }
 }
 

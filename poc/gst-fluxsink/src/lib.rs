@@ -10,7 +10,6 @@ use gst::glib;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_base as gst_base;
-use gstreamer_video as gst_video;
 
 gst::plugin_define!(
     fluxsink,
@@ -60,7 +59,7 @@ mod imp {
     use bytes::Bytes;
     use flux_framing::{
         now_ns, BandwidthProbe, BwAction, BwGovernor, CdbcFeedback, FluxControl, FluxHeader,
-        FrameType, SessionAccept, SessionRequest, DEFAULT_PORT, HEADER_SIZE,
+        FrameType, SessionAccept, SessionRequest, StreamAnnounce, DEFAULT_PORT, HEADER_SIZE,
     };
     use gst::subclass::prelude::*;
     use gst_base::subclass::prelude::*;
@@ -84,6 +83,16 @@ mod imp {
         cdbc_reports_received: Arc<AtomicU64>,
         /// Sender for FLUX-C control messages.
         flux_control_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<FluxControl>>>>,
+        /// A4: Generation counter incremented each time a new client connects.
+        /// The datagram-reader task receives a copy of its generation at spawn
+        /// time and exits as soon as the global counter advances past it.
+        reader_generation: Arc<AtomicU32>,
+        /// PTS of the last frame successfully sent to the client (nanoseconds,
+        /// pipeline clock).  render() drops any frame whose PTS is strictly
+        /// less than this value, enforcing monotonically-increasing PTS on the
+        /// wire.  Reset to 0 on each new client connection.
+        /// 0 means "nothing sent yet this session" (pass all frames through).
+        last_sent_pts_ns: Arc<AtomicU64>,
     }
 
     impl Default for Inner {
@@ -98,6 +107,8 @@ mod imp {
                 probe_seq: Arc::new(AtomicU32::new(0)),
                 cdbc_reports_received: Arc::new(AtomicU64::new(0)),
                 flux_control_tx: Arc::new(Mutex::new(None)),
+                reader_generation: Arc::new(AtomicU32::new(0)),
+                last_sent_pts_ns: Arc::new(AtomicU64::new(0)),
             }
         }
     }
@@ -243,9 +254,9 @@ mod imp {
 
             // ── quinn ServerConfig (with_single_cert handles TLS internally) ──
             let mut transport = quinn::TransportConfig::default();
-            transport.datagram_receive_buffer_size(Some(2 * 1024 * 1024));
+            transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
             transport.max_concurrent_bidi_streams(64u32.into());
-            transport.max_concurrent_uni_streams(128u32.into());
+            transport.max_concurrent_uni_streams(512u32.into());
             transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
 
             let mut server_cfg =
@@ -281,8 +292,8 @@ mod imp {
             let probe_seq_ref = s.probe_seq.clone();
             let cdbc_rx_ref = s.cdbc_reports_received.clone();
             let flux_ctrl_tx = s.flux_control_tx.clone();
-            // Weak reference to self so the accept task can send ForceKeyUnitEvent
-            let element_weak = self.obj().downgrade();
+            let reader_gen_ref = s.reader_generation.clone();
+            let last_sent_pts_ref = s.last_sent_pts_ns.clone();
 
             rt.spawn(async move {
                 accept_loop(
@@ -293,7 +304,8 @@ mod imp {
                     probe_seq_ref,
                     cdbc_rx_ref,
                     flux_ctrl_tx,
-                    element_weak,
+                    reader_gen_ref,
+                    last_sent_pts_ref,
                 )
                 .await;
             });
@@ -327,10 +339,48 @@ mod imp {
             })?;
             let payload = &data[HEADER_SIZE..];
 
-            let s = self.inner.lock().unwrap();
+            // A1: Extract the connection Arc without holding `inner` while we
+            // later acquire `connection`'s own lock.  Holding both simultaneously
+            // creates a fragile nested-lock ordering.
+            let (conn_arc, last_sent_pts) = {
+                let s = self.inner.lock().unwrap();
+                (s.connection.clone(), s.last_sent_pts_ns.clone())
+            };
+
+            // Wait for the first IDR before sending to the client.
+            // vtenc_h265 does not honour ForceKeyUnit immediately; it takes
+            // several frames.  We gate on is_keyframe() which is set by
+            // h265parse based on actual NAL unit type.
+            // last_sent_pts==0 means "no IDR sent yet this session".
+            if last_sent_pts.load(Ordering::Acquire) == 0 && !hdr.is_keyframe() {
+                return Ok(gst::FlowSuccess::Ok);
+            }
+
+            // Monotonicity enforcement: drop any frame whose PTS is strictly
+            // less than the last frame we sent.  This discards stale frames
+            // that vtenc_h265 flushes from its hardware pipeline after a
+            // ForceKeyUnit — they arrive out of PTS order relative to the IDR.
+            {
+                let frame_pts = hdr.group_timestamp_ns;
+                let prev = last_sent_pts.load(Ordering::Acquire);
+                if hdr.is_keyframe() {
+                    eprintln!(
+                        "[fluxsink] render: keyframe=true group_ts_ns={} last_sent={}",
+                        frame_pts, prev
+                    );
+                }
+                if prev > 0 && frame_pts < prev {
+                    eprintln!(
+                        "[fluxsink] drop stale frame pts_ns={} < last_sent_pts_ns={}",
+                        frame_pts, prev
+                    );
+                    return Ok(gst::FlowSuccess::Ok);
+                }
+                // Will update last_sent_pts after the send succeeds (below).
+            }
 
             let conn = {
-                let guard = s.connection.lock().unwrap();
+                let guard = conn_arc.lock().unwrap();
                 guard.clone()
             };
 
@@ -342,52 +392,65 @@ mod imp {
                 }
             };
 
-            // ── QUIC-aware fragmentation ──────────────────────────────────────
-            // QUIC datagram size is bounded by the negotiated path MTU (typically
-            // ~1200 bytes on loopback). Use conn.max_datagram_size() and leave
-            // 32 bytes for the FLUX header. Hard-floor at 512 bytes in case the
-            // runtime returns an unexpectedly small value.
-            let max_dg = conn.max_datagram_size().unwrap_or(1200);
-            let chunk_size = max_dg.saturating_sub(HEADER_SIZE).max(512);
+             // ── Stream-per-AU media delivery ─────────────────────────────────
+             // QUIC datagram frames are bounded by the path MTU (~1200 bytes)
+             // and cannot carry a full H.265 AU (up to ~200 KB for an IDR).
+             // Instead we open a short-lived unidirectional QUIC stream for each
+             // AU and write [FLUX_HEADER (frag=0) | PAYLOAD] to it.  The stream
+             // is immediately finished after the write, so the receiver sees EOF
+             // and knows the AU is complete.  This is reliable (QUIC streams are
+             // retransmitted) and unbounded in size.
+             //
+             // The stream open + write is async, so we fire it as a tokio task
+             // via the runtime stored in Inner.  render() is called on the GST
+             // streaming thread, not inside an async executor.
+             let rt_handle = {
+                 let s = self.inner.lock().unwrap();
+                 s.rt.as_ref().map(|r| r.handle().clone())
+             };
+             let rt_handle = match rt_handle {
+                 Some(h) => h,
+                 None => return Ok(gst::FlowSuccess::Ok),
+             };
 
-            let datagrams: Vec<Vec<u8>> = if payload.len() <= chunk_size {
-                // Single unfragmented datagram, frag=0
-                let mut h = hdr.clone();
-                h.frag = 0;
-                h.payload_length = payload.len() as u32;
-                let mut dg = Vec::with_capacity(HEADER_SIZE + payload.len());
-                dg.extend_from_slice(&h.encode());
-                dg.extend_from_slice(payload);
-                vec![dg]
-            } else {
-                let chunks: Vec<&[u8]> = payload.chunks(chunk_size).collect();
-                let n = chunks.len();
-                chunks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, chunk)| {
-                        let mut h = hdr.clone();
-                        // frag: 1-based index for non-last; 0xF for last fragment
-                        h.frag = if i == n - 1 { 0xF } else { (i + 1) as u8 };
-                        h.payload_length = chunk.len() as u32;
-                        let mut dg = Vec::with_capacity(HEADER_SIZE + chunk.len());
-                        dg.extend_from_slice(&h.encode());
-                        dg.extend_from_slice(chunk);
-                        dg
-                    })
-                    .collect()
-            };
+             // Build the unfragmented FLUX frame (frag=0).
+             let is_kf = hdr.is_keyframe();
+             let mut send_hdr = hdr.clone();
+             send_hdr.frag = 0;
+             send_hdr.payload_length = payload.len() as u32;
+             let mut frame = Vec::with_capacity(HEADER_SIZE + payload.len());
+             frame.extend_from_slice(&send_hdr.encode());
+             frame.extend_from_slice(payload);
+             let frame_bytes = bytes::Bytes::from(frame);
 
-            for datagram in datagrams {
-                let bytes = Bytes::from(datagram);
-                if let Err(e) = conn.send_datagram(bytes) {
-                    eprintln!("[fluxsink] send_datagram error: {}", e);
-                    // Clear connection so we wait for a new client.
-                    *s.connection.lock().unwrap() = None;
-                    return Ok(gst::FlowSuccess::Ok);
-                }
-            }
-            Ok(gst::FlowSuccess::Ok)
+             // Record this frame's PTS as the new high-water mark before
+             // dispatching the async send.  render() is called sequentially
+             // on the GStreamer streaming thread so no extra locking is needed.
+             let frame_pts = hdr.group_timestamp_ns;
+             let prev = last_sent_pts.load(Ordering::Acquire);
+             if frame_pts > prev {
+                 last_sent_pts.store(frame_pts, Ordering::Release);
+             }
+
+             rt_handle.spawn(async move {
+                 match conn.open_uni().await {
+                     Ok(mut uni) => {
+                         if is_kf { eprintln!("[fluxsink] open_uni OK keyframe=true, writing {} bytes", frame_bytes.len()); }
+                         if let Err(e) = uni.write_all(&frame_bytes).await {
+                             eprintln!("[fluxsink] media stream write error: {}", e);
+                         } else if let Err(e) = uni.finish() {
+                             eprintln!("[fluxsink] media stream finish error: {}", e);
+                         } else if is_kf {
+                             eprintln!("[fluxsink] media stream finished OK keyframe=true");
+                         }
+                     }
+                     Err(e) => {
+                         eprintln!("[fluxsink] open_uni for media error: {}", e);
+                     }
+                 }
+             });
+
+             Ok(gst::FlowSuccess::Ok)
         }
     }
 
@@ -401,7 +464,8 @@ mod imp {
         probe_seq: Arc<AtomicU32>,
         cdbc_reports_received: Arc<AtomicU64>,
         flux_control_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<FluxControl>>>>,
-        element_weak: gst::glib::WeakRef<super::FluxSink>,
+        reader_generation: Arc<AtomicU32>,
+        last_sent_pts: Arc<AtomicU64>,
     ) {
         static SESSION_COUNTER: std::sync::atomic::AtomicU32 =
             std::sync::atomic::AtomicU32::new(1);
@@ -469,7 +533,10 @@ mod imp {
                 eprintln!("[fluxsink] write SessionAccept: {}", e);
                 continue;
             }
-            let _ = send.finish();
+            if let Err(e) = send.finish() {
+                eprintln!("[fluxsink] finish SessionAccept stream: {}", e);
+                continue;
+            }
 
             *session_id_store.lock().unwrap() = session_id.clone();
             eprintln!(
@@ -478,31 +545,88 @@ mod imp {
                 conn.remote_address()
             );
 
-            // Publish connection so render() can send datagrams
-            *conn_slot.lock().unwrap() = Some(conn.clone());
+            // M1: Send STREAM_ANNOUNCE on a reliable unidirectional QUIC stream
+            // (spec §3.1 / §6.2).  One frame per channel × layer; PoC sends
+            // a single H.265 channel 0, layer 0.
+            {
+                let announce = StreamAnnounce {
+                    channel_id: 0,
+                    layer_id: 0,
+                    name: "FLUX_POC_VIDEO".into(),
+                    content_type: "video".into(),
+                    codec: "h265".into(),
+                    group_id: 1,
+                    sync_role: "master".into(),
+                    frame_rate: "60/1".into(),
+                    resolution: "1920x1080".into(),
+                    hdr: "sdr".into(),
+                    colorspace: "bt709".into(),
+                    glb_texture_role: None,
+                };
+                let json = serde_json::to_vec(&announce).unwrap_or_default();
+                // FLUX header for this stream frame
+                let hdr = FluxHeader {
+                    version: flux_framing::FLUX_VERSION,
+                    frame_type: FrameType::StreamAnnounce,
+                    flags: 0,
+                    channel_id: 0,
+                    layer: 0,
+                    frag: 0,
+                    group_id: 1,
+                    group_timestamp_ns: now_ns(),
+                    presentation_ts: 0,
+                    capture_ts_ns_lo: 0,
+                    payload_length: json.len() as u32,
+                    fec_group: 0,
+                    sequence_in_group: 0,
+                };
+                let mut msg = Vec::with_capacity(HEADER_SIZE + json.len());
+                msg.extend_from_slice(&hdr.encode());
+                msg.extend_from_slice(&json);
 
-            // Force an IDR keyframe so the new client doesn't receive P-frames
-            // before ever seeing an IDR (which h265parse/vtdec_hw would flag as
-            // "broken/invalid nal").  The UpstreamForceKeyUnitEvent travels up
-            // from fluxsink's sink pad toward vtenc_h265, telling it to emit an
-            // IDR on its very next output buffer.
-            if let Some(element) = element_weak.upgrade() {
-                let fku = gst_video::UpstreamForceKeyUnitEvent::builder()
-                    .all_headers(true)
-                    .build();
-                if let Some(sink_pad) = element.static_pad("sink") {
-                    sink_pad.send_event(fku);
-                    eprintln!("[fluxsink] ForceKeyUnitEvent sent upstream for new client");
+                match conn.open_uni().await {
+                    Ok(mut uni_send) => {
+                        if let Err(e) = uni_send.write_all(&msg).await {
+                            eprintln!("[fluxsink] write STREAM_ANNOUNCE: {}", e);
+                        } else if let Err(e) = uni_send.finish() {
+                            eprintln!("[fluxsink] finish STREAM_ANNOUNCE stream: {}", e);
+                        } else {
+                            eprintln!(
+                                "[fluxsink] STREAM_ANNOUNCE sent — ch=0 layer=0 codec=h265 peer={}",
+                                conn.remote_address()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[fluxsink] open_uni for STREAM_ANNOUNCE failed: {}", e);
+                    }
                 }
             }
 
-            // Spawn datagram reader task
+            // A4: Increment generation counter before publishing the new
+            // connection.  Any still-running datagram reader from the previous
+            // client will see the changed generation on its next loop iteration
+            // and exit, preventing two readers racing on conn_slot.
+            let my_gen = reader_generation.fetch_add(1, Ordering::Release) + 1;
+
+            // Reset the PTS high-water mark so the new session starts fresh.
+            // render() uses last_sent_pts==0 as a proxy for "no IDR seen yet":
+            // it drops all non-keyframe buffers until the first IDR arrives.
+            // vtenc_h265 emits IDRs naturally every ~2 s; no FKU push needed.
+            last_sent_pts.store(0, Ordering::Release);
+
+            // Publish connection so render() can (conditionally) send frames.
+            *conn_slot.lock().unwrap() = Some(conn.clone());
+
+            // Spawn datagram reader task — passes its expected generation so it
+            // self-terminates when a newer client connects.
             let conn_for_reader = conn.clone();
             let conn_slot_reader = conn_slot.clone();
             let bw_ref = bw_gov.clone();
             let probe_ref = probe_seq.clone();
             let cdbc_ref = cdbc_reports_received.clone();
             let ctrl_tx = flux_control_tx.clone();
+            let gen_ref = reader_generation.clone();
 
             tokio::spawn(async move {
                 run_datagram_reader(
@@ -512,6 +636,8 @@ mod imp {
                     probe_ref,
                     cdbc_ref,
                     ctrl_tx,
+                    gen_ref,
+                    my_gen,
                 )
                 .await;
             });
@@ -552,8 +678,19 @@ mod imp {
         probe_seq: Arc<AtomicU32>,
         cdbc_reports_received: Arc<AtomicU64>,
         flux_control_tx: Arc<Mutex<Option<std::sync::mpsc::SyncSender<FluxControl>>>>,
+        gen_ref: Arc<AtomicU32>,
+        my_gen: u32,
     ) {
         loop {
+            // A4: Exit immediately if a newer client has connected.
+            if gen_ref.load(Ordering::Acquire) != my_gen {
+                eprintln!(
+                    "[fluxsink/dgram] reader gen={} superseded — exiting",
+                    my_gen
+                );
+                break;
+            }
+
             let datagram = match conn.read_datagram().await {
                 Ok(d) => d,
                 Err(e) => {

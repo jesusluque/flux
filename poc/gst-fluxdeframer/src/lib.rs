@@ -55,32 +55,51 @@ impl FluxDeframer {
 
 mod imp {
     use super::*;
-    use flux_framing::{reconstruct_capture_ts, FluxHeader, FrameType, FLUX_VERSION, HEADER_SIZE};
+    use flux_framing::{FluxHeader, FrameType, FLUX_VERSION, HEADER_SIZE};
     use gst::subclass::prelude::*;
     use gst_base::subclass::base_transform::GenerateOutputSuccess;
     use gst_base::subclass::prelude::*;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     // ── Fragment reassembly state ─────────────────────────────────────────────
+    //
+    // Spec §4.1 FRAG field encoding:
+    //   0x0       = unfragmented (complete AU in one datagram)
+    //   0x1–0xD   = fragment index (1-based); more fragments follow
+    //   0xE       = last fragment (its 1-based index tells us the total count)
+    //   0xF       = reserved
+    //
+    // QUIC datagrams are delivered best-effort and may arrive out of order.
+    // We store every received fragment in a BTreeMap keyed by its 1-based index
+    // and only emit the reassembled AU once all expected fragments are present.
 
     struct FragState {
         /// sequence_in_group of the AU being assembled (None = idle).
         seq: Option<u32>,
-        /// Accumulated payload bytes from all received fragments.
-        payload: Vec<u8>,
-        /// Header from the first fragment (carries timestamps, flags).
+        /// Received fragments: frag_index (1-based) → payload chunk.
+        frags: BTreeMap<u8, Vec<u8>>,
+        /// Header from the first fragment received (carries timestamps, flags).
         hdr: Option<FluxHeader>,
+        /// Total expected fragment count, set when the 0xE (last) frag arrives.
+        /// None means the last fragment has not arrived yet.
+        total: Option<u8>,
         /// A fully reassembled AU ready to be pushed, or None.
-        ready: Option<(Vec<u8>, FluxHeader)>,
+        /// The bool indicates whether DISCONT should be set on the output buffer.
+        ready: Option<(Vec<u8>, FluxHeader, bool)>,
+        /// Carry the DISCONT flag for the AU currently being assembled.
+        pending_discont: bool,
     }
 
     impl Default for FragState {
         fn default() -> Self {
             FragState {
                 seq: None,
-                payload: Vec::new(),
+                frags: BTreeMap::new(),
                 hdr: None,
+                total: None,
                 ready: None,
+                pending_discont: false,
             }
         }
     }
@@ -88,8 +107,28 @@ mod imp {
     impl FragState {
         fn reset_assembly(&mut self) {
             self.seq = None;
-            self.payload.clear();
+            self.frags.clear();
             self.hdr = None;
+            self.total = None;
+            self.pending_discont = false;
+        }
+
+        /// Returns true if every expected fragment has arrived.
+        fn is_complete(&self) -> bool {
+            if let Some(total) = self.total {
+                self.frags.len() == total as usize
+            } else {
+                false
+            }
+        }
+
+        /// Concatenate all fragments in index order into a single payload.
+        fn assemble(&mut self) -> Vec<u8> {
+            let mut out = Vec::new();
+            for (_, chunk) in &self.frags {
+                out.extend_from_slice(chunk);
+            }
+            out
         }
     }
 
@@ -165,13 +204,10 @@ mod imp {
             is_discont: bool,
             inbuf: gst::Buffer,
         ) -> Result<gst::FlowSuccess, gst::FlowError> {
-            let _ = is_discont;
-
             let map = inbuf.map_readable().map_err(|_| gst::FlowError::Error)?;
             let data = map.as_slice();
 
             if data.len() < HEADER_SIZE {
-                // Too short — discard silently
                 return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
             }
 
@@ -198,61 +234,111 @@ mod imp {
 
             let mut st = self.state.lock().unwrap();
 
+            // Fix 2: A DISCONT input means the upstream reference chain is
+            // broken (new session / reconnect).  Discard any in-progress
+            // fragment assembly and propagate the flag to the next output buffer.
+            if is_discont {
+                st.reset_assembly();
+                st.pending_discont = true;
+            }
+
+            let seq = hdr.sequence_in_group;
+
             match hdr.frag {
+                // ── Unfragmented AU ───────────────────────────────────────────
                 0x0 => {
-                    // Unfragmented — emit immediately
                     if st.seq.is_some() {
                         eprintln!(
                             "[fluxdeframer] unfragmented seq={} arrived while seq={:?} in progress — discarding old",
-                            hdr.sequence_in_group, st.seq
+                            seq, st.seq
                         );
                         st.reset_assembly();
                     }
-                    st.ready = Some((chunk.to_vec(), hdr));
+                    let discont = st.pending_discont;
+                    st.pending_discont = false;
+                    st.ready = Some((chunk.to_vec(), hdr.clone(), discont));
                 }
-                0xF => {
-                    // Last fragment
-                    if st.seq != Some(hdr.sequence_in_group) {
+
+                // ── Last fragment (spec 0xE) ───────────────────────────────────
+                0xE => {
+                    // If this is for a different seq, discard any old assembly.
+                    if st.seq.is_some() && st.seq != Some(seq) {
                         eprintln!(
-                            "[fluxdeframer] last-frag seq={} but assembling={:?} — discarding",
-                            hdr.sequence_in_group, st.seq
+                            "[fluxdeframer] last-frag seq={} arrived while assembling seq={:?} — discarding old",
+                            seq, st.seq
                         );
                         st.reset_assembly();
-                        return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
                     }
-                    st.payload.extend_from_slice(chunk);
-                    let payload = std::mem::take(&mut st.payload);
-                    let first_hdr = st.hdr.take().unwrap();
-                    st.reset_assembly();
-                    st.ready = Some((payload, first_hdr));
-                }
-                n => {
-                    // Middle / first fragment (0x1..0xE)
-                    if n == 1 || st.seq.is_none() {
-                        if st.seq.is_some() && st.seq != Some(hdr.sequence_in_group) {
-                            eprintln!(
-                                "[fluxdeframer] new seq={} while seq={:?} incomplete — discarding old",
-                                hdr.sequence_in_group, st.seq
-                            );
-                        }
-                        st.reset_assembly();
-                        st.seq = Some(hdr.sequence_in_group);
+                    if st.seq.is_none() {
+                        st.seq = Some(seq);
+                    }
+                    // Store frag 0xE under its sentinel key.  We compute total as
+                    // (highest non-last index + 1) once both the last-frag and at
+                    // least one mid-frag are present.  If 0xE is the only frag so
+                    // far (out-of-order: last arrived first), total stays None
+                    // until the mid-frags fill in.
+                    if st.hdr.is_none() {
                         st.hdr = Some(hdr.clone());
-                    } else if st.seq != Some(hdr.sequence_in_group) {
+                    }
+                    st.frags.insert(0xE, chunk.to_vec());
+                    let highest_mid = st.frags.keys().filter(|&&k| k != 0xE).max().copied();
+                    let total = highest_mid.map(|h| h + 1).unwrap_or(1);
+                    st.total = Some(total);
+                }
+
+                // ── Mid / first fragment (0x1–0xD) ───────────────────────────
+                n @ 0x1..=0xD => {
+                    // If this is for a different seq, discard old assembly.
+                    if st.seq.is_some() && st.seq != Some(seq) {
                         eprintln!(
-                            "[fluxdeframer] mid-frag seq={} != assembling={:?} — discarding",
-                            hdr.sequence_in_group, st.seq
+                            "[fluxdeframer] frag={} seq={} arrived while assembling seq={:?} — discarding old",
+                            n, seq, st.seq
                         );
                         st.reset_assembly();
-                        return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
                     }
-                    st.payload.extend_from_slice(chunk);
-                    // Not ready yet — signal no output needed
+                    if st.seq.is_none() {
+                        st.seq = Some(seq);
+                    }
+                    // Keep the header from fragment index 1 (the canonical first
+                    // fragment) because it carries the correct timestamps.
+                    // If frag=1 hasn't arrived yet, store any header as a fallback
+                    // and replace it when frag=1 does arrive.
+                    if st.hdr.is_none() || n == 1 {
+                        st.hdr = Some(hdr.clone());
+                    }
+                    st.frags.insert(n, chunk.to_vec());
+
+                    // If the last fragment (0xE) already arrived, recompute total.
+                    if st.frags.contains_key(&0xE) {
+                        let highest_mid = st.frags.keys().filter(|&&k| k != 0xE).max().copied();
+                        let total = highest_mid.map(|h| h + 1).unwrap_or(1);
+                        st.total = Some(total);
+                    }
+                }
+
+                _ => {
+                    // frag=0xF is reserved — discard
                     return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
                 }
             }
 
-            // AU is ready — tell GStreamer to call generate_output()
+            // Check if the AU is fully reassembled.
+            if hdr.frag == 0x0 {
+                // Already placed in ready above.
+                return Ok(gst::FlowSuccess::Ok);
+            }
+
+            if !st.is_complete() {
+                return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+            }
+
+            // All fragments received — assemble and move to ready.
+            let payload = st.assemble();
+            let first_hdr = st.hdr.take().unwrap();
+            let discont = st.pending_discont;
+            st.reset_assembly();
+            st.ready = Some((payload, first_hdr, discont));
+
             Ok(gst::FlowSuccess::Ok)
         }
 
@@ -260,31 +346,42 @@ mod imp {
         /// `state.ready` holds the fully reassembled AU; allocate a new buffer
         /// of exactly the right size and fill it.
         fn generate_output(&self) -> Result<GenerateOutputSuccess, gst::FlowError> {
-            let (payload, hdr) = {
+            let (payload, hdr, discont) = {
                 let mut st = self.state.lock().unwrap();
                 match st.ready.take() {
-                    Some(pair) => pair,
+                    Some(triple) => triple,
                     None => {
                         return Ok(GenerateOutputSuccess::NoOutput);
                     }
                 }
             };
 
-            let full_capture_ns =
-                reconstruct_capture_ts(hdr.group_timestamp_ns, hdr.capture_ts_ns_lo);
-
-            let pts = gst::ClockTime::from_nseconds(
-                (hdr.presentation_ts as u64) * (1_000_000_000 / 90_000),
-            );
+            // group_timestamp_ns carries the full DTS (== PTS since the server
+            // uses allow-frame-reordering=false).  Use it directly for both PTS
+            // and DTS.  presentation_ts is a u32 90kHz field that overflows after
+            // ~13 hours of uptime — unusable on a machine with ~1000 h uptime.
+            let ts = gst::ClockTime::from_nseconds(hdr.group_timestamp_ns);
+            if hdr.is_keyframe() {
+                eprintln!(
+                    "[fluxdeframer] output buf: keyframe=true group_timestamp_ns={} pts_gst={}",
+                    hdr.group_timestamp_ns, ts,
+                );
+            }
 
             let mut outbuf =
                 gst::Buffer::with_size(payload.len()).map_err(|_| gst::FlowError::Error)?;
             {
                 let outbuf_ref = outbuf.get_mut().ok_or(gst::FlowError::Error)?;
-                outbuf_ref.set_pts(pts);
-                outbuf_ref.set_dts(gst::ClockTime::from_nseconds(full_capture_ns));
+                outbuf_ref.set_pts(ts);
+                outbuf_ref.set_dts(ts);
                 if !hdr.is_keyframe() {
                     outbuf_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
+                }
+                // Fix 2: Forward DISCONT from the upstream source buffer so that
+                // h265parse and vtdec_hw know the reference picture chain is
+                // broken and reset their internal state accordingly.
+                if discont {
+                    outbuf_ref.set_flags(gst::BufferFlags::DISCONT);
                 }
                 let mut map = outbuf_ref
                     .map_writable()

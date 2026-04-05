@@ -1,13 +1,13 @@
 //! FLUX wire-format: 32-byte header, frame types, JSON structs.
 //!
-//! Spec reference: FLUX_Protocol_Spec_v0_4_EN.md §4
+//! Spec reference: FLUX_Protocol_Spec_v0_6_2_EN.md §4
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 
-pub const FLUX_VERSION: u8 = 4;
+pub const FLUX_VERSION: u8 = 6;
 pub const HEADER_SIZE: usize = 32;
 
 /// Default media port (spec §7.1)
@@ -41,11 +41,19 @@ pub enum FrameType {
     BandwidthProbe = 0xD,
     EmbedManifest = 0xE,
     EmbedChunk = 0xF,
+    // v0.6 additions (spec §4.3)
+    FluxmKeyEpoch = 0x10,
+    FluxmNack = 0x11,
+    FluxmStat = 0x12,
 }
 
 impl FrameType {
+    /// Decode a raw frame-type byte.
+    ///
+    /// The `& 0x0F` mask that existed in v0.4 is intentionally removed: types
+    /// 0x10–0x12 were added in v0.6 and would be silently corrupted by it.
     pub fn from_u8(v: u8) -> Option<Self> {
-        match v & 0x0F {
+        match v {
             0x0 => Some(Self::MediaData),
             0x1 => Some(Self::CdbcFeedbackT),
             0x2 => Some(Self::SyncAnchor),
@@ -62,6 +70,9 @@ impl FrameType {
             0xD => Some(Self::BandwidthProbe),
             0xE => Some(Self::EmbedManifest),
             0xF => Some(Self::EmbedChunk),
+            0x10 => Some(Self::FluxmKeyEpoch),
+            0x11 => Some(Self::FluxmNack),
+            0x12 => Some(Self::FluxmStat),
             _ => None,
         }
     }
@@ -115,6 +126,13 @@ pub struct FluxHeader {
 
 impl FluxHeader {
     /// Create a MEDIA_DATA header for an H.265 buffer.
+    ///
+    /// `pts_ns` and `dts_ns` should come from the upstream GStreamer buffer's
+    /// PTS and DTS (nanoseconds from the pipeline clock origin, i.e. small
+    /// values starting near 0 at pipeline start).  Using wall-clock `now_ns()`
+    /// here caused u32 overflow in `presentation_ts` (90 kHz ticks of a wall-
+    /// clock timestamp exceed 2³² after ~13 hours, but wrap randomly on a
+    /// freshly started pipeline because the Unix epoch offset is already huge).
     pub fn new_media(
         channel_id: u16,
         group_id: u16,
@@ -122,10 +140,14 @@ impl FluxHeader {
         is_keyframe: bool,
         payload_len: u32,
         seq: u32,
+        pts_ns: u64,
+        dts_ns: u64,
     ) -> Self {
-        let now_ns = now_ns();
-        let pts_90k = (now_ns / (1_000_000_000 / PTS_CLOCK_HZ)) as u32;
-        let mut f: u8 = 0; // no metadata in the PoC
+        // presentation_ts: 90 kHz ticks.  pts_ns is small (pipeline clock),
+        // so the conversion and the u32 truncation are safe for sessions up to
+        // ~13 hours (2^32 / 90000 ≈ 47721 s).
+        let pts_90k = (pts_ns / (1_000_000_000 / PTS_CLOCK_HZ)) as u32;
+        let mut f: u8 = 0;
         if is_keyframe {
             f |= flags::KEYFRAME;
         }
@@ -138,9 +160,12 @@ impl FluxHeader {
             layer,
             frag: 0,
             group_id,
-            group_timestamp_ns: now_ns,
+            // group_timestamp_ns carries the full DTS (nanoseconds from
+            // pipeline clock origin) so the receiver can use it as DTS.
+            group_timestamp_ns: dts_ns,
             presentation_ts: pts_90k,
-            capture_ts_ns_lo: (now_ns & 0xFFFF_FFFF) as u32,
+            // capture_ts_ns_lo: low 32 bits of DTS for reconstruct_capture_ts.
+            capture_ts_ns_lo: (dts_ns & 0xFFFF_FFFF) as u32,
             payload_length: payload_len,
             fec_group: 0,
             sequence_in_group: seq,
@@ -268,28 +293,94 @@ impl FluxHeader {
 
 /// Reconstruct full 64-bit capture timestamp from the low-32 field and the
 /// known GROUP_TIMESTAMP_NS. Valid when |capture_ts – group_ts| < 2.147 s.
+///
+/// Comparisons are performed on 32-bit values (wrapping) to correctly handle
+/// modular arithmetic at the 2³² boundary.  Using 64-bit arithmetic caused
+/// off-by-one errors at the epoch boundary.
 pub fn reconstruct_capture_ts(group_ts_ns: u64, capture_ts_lo: u32) -> u64 {
-    let c = capture_ts_lo as u64;
-    let g_lo = group_ts_ns & 0xFFFF_FFFF;
+    let c = capture_ts_lo;
+    let g_lo = group_ts_ns as u32; // low 32 bits — intentional truncation
     let candidate_hi = group_ts_ns & 0xFFFF_FFFF_0000_0000;
 
-    if c > g_lo.wrapping_add(1u64 << 31) {
+    // All comparisons are done on u32, so wrapping at 2³² is automatic.
+    if c > g_lo.wrapping_add(1u32 << 31) {
         // C is from the previous wrap epoch
-        candidate_hi.wrapping_sub(1u64 << 32) | c
-    } else if g_lo > c.wrapping_add(1u64 << 31) {
+        candidate_hi.wrapping_sub(1u64 << 32) | (c as u64)
+    } else if g_lo > c.wrapping_add(1u32 << 31) {
         // C is from the next wrap epoch
-        candidate_hi.wrapping_add(1u64 << 32) | c
+        candidate_hi.wrapping_add(1u64 << 32) | (c as u64)
     } else {
-        candidate_hi | c
+        candidate_hi | (c as u64)
     }
 }
 
 // ─── JSON message structs ─────────────────────────────────────────────────────
 
+/// Embed capabilities declared by the client in SESSION_REQUEST (spec §3.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedSupport {
+    #[serde(default)]
+    pub max_concurrent_assets: u32,
+    #[serde(default)]
+    pub max_asset_size_mb: u32,
+    #[serde(default)]
+    pub delta_support: bool,
+    #[serde(default)]
+    pub sequence_support: bool,
+    #[serde(default)]
+    pub video_texture_binding_support: bool,
+    /// GS residual codec identifiers (spec §3.2 / §10.9): "raw-attr", "queen-v1"
+    #[serde(default)]
+    pub gs_codecs: Vec<String>,
+    #[serde(default)]
+    pub mime_types: Vec<String>,
+}
+
+impl Default for EmbedSupport {
+    fn default() -> Self {
+        EmbedSupport {
+            max_concurrent_assets: 8,
+            max_asset_size_mb: 512,
+            delta_support: true,
+            sequence_support: true,
+            video_texture_binding_support: true,
+            gs_codecs: vec!["raw-attr".into()],
+            mime_types: vec![
+                "model/gltf-binary".into(),
+                "model/vnd.gaussian-splat".into(),
+                "application/vnd.flux.gs-residual".into(),
+                "application/vnd.flux.gs-delta".into(),
+                "application/json".into(),
+                "application/octet-stream".into(),
+            ],
+        }
+    }
+}
+
+/// Upstream-control capabilities (spec §12).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct UpstreamControl {
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub max_commands_per_second: u32,
+}
+
+/// Cached embed asset entry declared by the client (spec §3.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedCacheEntry {
+    pub asset_id: String,
+    pub sha256: String,
+}
+
 /// SESSION_REQUEST from client → server (spec §3.1 / §3.2)
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionRequest {
     pub flux_version: String,
+    /// Informative profile field (spec §3.2 v0.6 note). Optional — servers treat
+    /// its absence as `"flux_quic"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flux_profile: Option<String>,
     pub client_id: String,
     pub crypto_mode: String,
     pub codec_support: Vec<String>,
@@ -298,28 +389,82 @@ pub struct SessionRequest {
     pub max_fps: u16,
     pub sync_mode: String,
     pub ptp_mode: String,
+    #[serde(default)]
+    pub sync_tolerance_ns: u64,
+    #[serde(default)]
+    pub fec_support: Vec<String>,
     pub cdbc_interval_ms: u32,
-    /// UDP port the client is listening on for incoming media datagrams.
-    /// The server uses this to direct media instead of assuming a fixed port.
-    pub media_port: u16,
+    #[serde(default)]
+    pub cdbc_interval_min_ms: u32,
+    #[serde(default)]
+    pub hdr_support: Vec<String>,
+    #[serde(default)]
+    pub audio_formats: Vec<String>,
+    #[serde(default)]
+    pub embed_support: EmbedSupport,
+    #[serde(default)]
+    pub tally_support: bool,
+    #[serde(default)]
+    pub monitor_stream: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_control: Option<UpstreamControl>,
+    /// Previously-cached embed assets (spec §3.2).
+    #[serde(default)]
+    pub embed_cache: Vec<EmbedCacheEntry>,
 }
 
 impl Default for SessionRequest {
     fn default() -> Self {
         SessionRequest {
-            flux_version: "0.4".into(),
+            flux_version: "0.6.2".into(),
+            flux_profile: Some("flux_quic".into()),
             client_id: "FLUX-POC-CLIENT-01".into(),
-            crypto_mode: "crypto_none".into(),
+            crypto_mode: "crypto_quic".into(),
             codec_support: vec!["h265".into()],
             max_channels: 4,
             max_layers: 1,
             max_fps: 60,
             sync_mode: "frame_sync".into(),
             ptp_mode: "software".into(),
+            sync_tolerance_ns: 500_000,
+            fec_support: vec!["xor".into()],
             cdbc_interval_ms: 50,
-            media_port: 7402,
+            cdbc_interval_min_ms: 10,
+            hdr_support: vec!["sdr".into(), "hlg".into(), "pq".into()],
+            audio_formats: vec!["pcm_f32".into()],
+            embed_support: EmbedSupport::default(),
+            tally_support: false,
+            monitor_stream: false,
+            upstream_control: None,
+            embed_cache: vec![],
         }
     }
+}
+
+/// Stream descriptor returned in SESSION_ACCEPT (spec §3.1).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StreamDescriptor {
+    pub channel_id: u16,
+    pub layer: u8,
+    pub codec: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
+    #[serde(default)]
+    pub fps_num: u32,
+    #[serde(default)]
+    pub fps_den: u32,
+    #[serde(default)]
+    pub bit_depth: u8,
+    #[serde(default)]
+    pub hdr_mode: String,
+    #[serde(default)]
+    pub audio_channels: u8,
+    #[serde(default)]
+    pub audio_sample_rate: u32,
+    #[serde(default)]
+    pub audio_format: String,
 }
 
 /// SESSION_ACCEPT from server → client (spec §3.1)
@@ -327,23 +472,101 @@ impl Default for SessionRequest {
 pub struct SessionAccept {
     pub flux_version: String,
     pub session_id: String,
+    /// Active streams (one entry per channel × layer) — may be empty in PoC
+    /// until STREAM_ANNOUNCE is implemented.
+    #[serde(default)]
+    pub streams: Vec<StreamDescriptor>,
+    /// Group IDs announced by this server.
+    #[serde(default)]
+    pub group_ids: Vec<u16>,
+    /// FEC schema in use: "none", "xor", "rs_2d".
+    #[serde(default = "default_fec_schema")]
+    pub fec_schema: String,
+    /// PTP anchor timestamp (ns) for clock synchronisation.
+    #[serde(default)]
+    pub ptp_anchor_ns: u64,
+    /// Embed catalog entries available on this server.
+    #[serde(default)]
+    pub embed_catalog: Vec<String>,
+    /// Channel/stream ID of the monitor copy, if any.
+    #[serde(default)]
+    pub monitor_stream_id: Option<u16>,
     pub crypto_mode_ack: String,
-    pub keepalive_interval_ms: u32,
-    pub keepalive_timeout: u32,
     pub max_datagram_size: u32,
+    pub keepalive_interval_ms: u32,
+    /// Number of missed keepalive intervals before the session is declared dead (spec §3.3).
+    pub keepalive_timeout_count: u32,
+}
+
+fn default_fec_schema() -> String {
+    "none".into()
 }
 
 impl Default for SessionAccept {
     fn default() -> Self {
         SessionAccept {
-            flux_version: "0.4".into(),
+            flux_version: "0.6.2".into(),
             session_id: "poc-session-001".into(),
-            crypto_mode_ack: "crypto_none".into(),
+            streams: vec![],
+            group_ids: vec![],
+            fec_schema: "none".into(),
+            ptp_anchor_ns: 0,
+            embed_catalog: vec![],
+            monitor_stream_id: None,
+            crypto_mode_ack: "crypto_quic".into(),
             keepalive_interval_ms: 1000,
-            keepalive_timeout: 3,
+            keepalive_timeout_count: 3,
             max_datagram_size: 65000,
         }
     }
+}
+
+/// STREAM_ANNOUNCE payload (spec §6.2).
+///
+/// Sent by the server on a reliable QUIC uni-directional stream immediately
+/// after SESSION_ACCEPT — one frame per channel × layer.  The JSON body is
+/// wrapped with the standard 32-byte FLUX header (TYPE=0x5).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamAnnounce {
+    pub channel_id: u16,
+    pub layer_id: u8,
+    pub name: String,
+    pub content_type: String,
+    pub codec: String,
+    #[serde(default)]
+    pub group_id: u16,
+    /// Sync role: "master" | "slave" | "independent"
+    #[serde(default = "default_sync_role")]
+    pub sync_role: String,
+    /// Frame rate as "num/den" string, e.g. "60/1".
+    #[serde(default)]
+    pub frame_rate: String,
+    /// Resolution as "WxH" string, e.g. "1920x1080".
+    #[serde(default)]
+    pub resolution: String,
+    #[serde(default)]
+    pub hdr: String,
+    #[serde(default)]
+    pub colorspace: String,
+    /// Optional GLB video-texture binding (spec §6.2 v0.5+).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glb_texture_role: Option<GlbTextureRole>,
+}
+
+fn default_sync_role() -> String {
+    "master".into()
+}
+
+/// GLB video-texture binding declared in STREAM_ANNOUNCE (spec §6.2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlbTextureRole {
+    pub asset_id: String,
+    pub material_path: String,
+    pub slot: String,
+    #[serde(default)]
+    pub hint_resolution: String,
+    #[serde(default)]
+    pub hint_format: String,
 }
 
 /// CDBC_FEEDBACK datagram (spec §5.2)
@@ -831,44 +1054,79 @@ mod tests {
     #[test]
     fn session_request_roundtrip() {
         let req = SessionRequest {
-            flux_version: "0.4".into(),
+            flux_version: "0.6.2".into(),
+            flux_profile: Some("flux_quic".into()),
             client_id: "test-client".into(),
-            crypto_mode: "crypto_none".into(),
+            crypto_mode: "crypto_quic".into(),
             codec_support: vec!["h265".into(), "av1".into()],
             max_channels: 8,
             max_layers: 2,
             max_fps: 120,
             sync_mode: "frame_sync".into(),
             ptp_mode: "software".into(),
+            sync_tolerance_ns: 500_000,
+            fec_support: vec!["xor".into()],
             cdbc_interval_ms: 25,
-            media_port: 9000,
+            cdbc_interval_min_ms: 10,
+            hdr_support: vec!["sdr".into(), "hlg".into()],
+            audio_formats: vec!["pcm_f32".into()],
+            embed_support: EmbedSupport::default(),
+            tally_support: true,
+            monitor_stream: false,
+            upstream_control: None,
+            embed_cache: vec![],
         };
         let json = serde_json::to_vec(&req).unwrap();
         let back: SessionRequest = serde_json::from_slice(&json).unwrap();
         assert_eq!(back.flux_version, req.flux_version);
+        assert_eq!(back.flux_profile, req.flux_profile);
         assert_eq!(back.client_id, req.client_id);
         assert_eq!(back.codec_support, req.codec_support);
         assert_eq!(back.max_fps, req.max_fps);
-        assert_eq!(back.media_port, req.media_port);
         assert_eq!(back.cdbc_interval_ms, req.cdbc_interval_ms);
+        assert_eq!(back.sync_tolerance_ns, req.sync_tolerance_ns);
+        assert_eq!(back.fec_support, req.fec_support);
+        assert_eq!(back.tally_support, req.tally_support);
     }
 
     #[test]
     fn session_accept_roundtrip() {
         let accept = SessionAccept {
-            flux_version: "0.4".into(),
+            flux_version: "0.6.2".into(),
             session_id: "sess-1234567890-1".into(),
-            crypto_mode_ack: "crypto_none".into(),
+            streams: vec![StreamDescriptor {
+                channel_id: 0,
+                layer: 0,
+                codec: "h265".into(),
+                width: 1920,
+                height: 1080,
+                fps_num: 60,
+                fps_den: 1,
+                bit_depth: 8,
+                hdr_mode: "sdr".into(),
+                ..StreamDescriptor::default()
+            }],
+            group_ids: vec![1],
+            fec_schema: "none".into(),
+            ptp_anchor_ns: 12345678,
+            embed_catalog: vec![],
+            monitor_stream_id: None,
+            crypto_mode_ack: "crypto_quic".into(),
             keepalive_interval_ms: 500,
-            keepalive_timeout: 5,
+            keepalive_timeout_count: 5,
             max_datagram_size: 9000,
         };
         let json = serde_json::to_vec(&accept).unwrap();
         let back: SessionAccept = serde_json::from_slice(&json).unwrap();
         assert_eq!(back.session_id, accept.session_id);
         assert_eq!(back.keepalive_interval_ms, accept.keepalive_interval_ms);
-        assert_eq!(back.keepalive_timeout, accept.keepalive_timeout);
+        assert_eq!(back.keepalive_timeout_count, accept.keepalive_timeout_count);
         assert_eq!(back.max_datagram_size, accept.max_datagram_size);
+        assert_eq!(back.fec_schema, accept.fec_schema);
+        assert_eq!(back.ptp_anchor_ns, accept.ptp_anchor_ns);
+        assert_eq!(back.streams.len(), 1);
+        assert_eq!(back.streams[0].codec, "h265");
+        assert_eq!(back.group_ids, vec![1]);
     }
 
     #[test]

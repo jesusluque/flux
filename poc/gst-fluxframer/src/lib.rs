@@ -168,6 +168,17 @@ mod imp {
         const PASSTHROUGH_ON_SAME_CAPS: bool = false;
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = false;
 
+        /// Explicitly pass upstream events (e.g. ForceKeyUnit) from our src pad
+        /// through to our sink pad so they reach vtenc_h265.  BaseTransform
+        /// default does forward them, but this makes it explicit and lets us log.
+        fn src_event(&self, event: gst::Event) -> bool {
+            eprintln!(
+                "[fluxframer] src_event: type={:?} — forwarding upstream",
+                event.type_()
+            );
+            self.parent_src_event(event)
+        }
+
         fn transform(
             &self,
             inbuf: &gst::Buffer,
@@ -178,6 +189,26 @@ mod imp {
 
             let is_keyframe = !inbuf.flags().contains(gst::BufferFlags::DELTA_UNIT);
 
+            if is_keyframe {
+                eprintln!(
+                    "[fluxframer] transform: pts={:?} flags={:?} is_keyframe={}",
+                    inbuf.pts(),
+                    inbuf.flags(),
+                    is_keyframe
+                );
+            }
+
+            // Use the buffer's GStreamer PTS/DTS (nanoseconds from pipeline
+            // clock origin — starts near 0 at pipeline start).  Falling back
+            // to 0 if either is NONE is safe: the client will just show a
+            // PTS of 0 for that frame, which GStreamer handles gracefully.
+            let pts_ns = inbuf.pts().map(|t| t.nseconds()).unwrap_or(0);
+            let dts_ns = inbuf
+                .dts()
+                .or_else(|| inbuf.pts())
+                .map(|t| t.nseconds())
+                .unwrap_or(0);
+
             let mut st = self.state.lock().unwrap();
             st.seq = st.seq.wrapping_add(1);
             let hdr = FluxHeader::new_media(
@@ -187,6 +218,8 @@ mod imp {
                 is_keyframe,
                 payload.len() as u32,
                 st.seq,
+                pts_ns,
+                dts_ns,
             );
             drop(st);
 
