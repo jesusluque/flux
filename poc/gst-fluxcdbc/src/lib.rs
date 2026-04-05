@@ -7,10 +7,15 @@
 //!   2. Send CDBC_FEEDBACK JSON datagrams to the server at an adaptive interval
 //!      (50 ms normal, 10 ms under loss — spec §5.1)
 //!
+//! CDBC_FEEDBACK is delivered as a QUIC Datagram (spec §4.4 table).  The caller
+//! must inject a send callback via [`FluxCdbc::set_send_callback`] before the
+//! element transitions to PLAYING.  The callback receives the fully-encoded
+//! datagram bytes and is responsible for forwarding them over the QUIC connection
+//! (e.g. `fluxsrc.send_datagram(pkt)`).  If no callback is set, feedback is
+//! silently discarded (element still measures and exposes stats).
+//!
 //! Properties:
-//!   server-address  — IP of the FLUX server (default: 127.0.0.1)
-//!   server-port     — UDP port of the server  (default: 7400)
-//!   cdbc-interval   — normal interval ms (default: 50)
+//!   cdbc-interval     — normal interval ms (default: 50)
 //!   cdbc-min-interval — fast interval ms (default: 10)
 //!
 //! Exposes read-only stats properties: loss-pct, jitter-ms, rx-bps
@@ -54,12 +59,29 @@ impl FluxCdbc {
             Self::static_type(),
         )
     }
+
+    /// Register a callback that will be called with each encoded CDBC_FEEDBACK
+    /// datagram.  Wire this to `fluxsrc.send_datagram()` so feedback is
+    /// delivered over QUIC (spec §4.4 — QUIC Datagram delivery).
+    ///
+    /// # Example
+    /// ```ignore
+    /// let src = fluxsrc.clone();
+    /// fluxcdbc.set_send_callback(move |pkt| { src.send_datagram(pkt); });
+    /// ```
+    pub fn set_send_callback<F>(&self, f: F)
+    where
+        F: Fn(Vec<u8>) + Send + Sync + 'static,
+    {
+        use gstreamer::subclass::prelude::ObjectSubclassExt;
+        imp::FluxCdbc::from_obj(self).set_send_fn(Box::new(f));
+    }
 }
 
 // ─── Implementation submodule ─────────────────────────────────────────────────
 
 mod imp {
-    use flux_framing::{now_ns, CdbcFeedback, FluxHeader, FrameType, DEFAULT_PORT, HEADER_SIZE};
+    use flux_framing::{now_ns, CdbcFeedback, FluxHeader, FrameType, HEADER_SIZE};
     use gst::glib;
     use gst::{Buffer, FlowError};
     use gstreamer as gst;
@@ -69,16 +91,16 @@ mod imp {
     use gstreamer_base::prelude::*;
     use gstreamer_base::subclass::prelude::*;
     use serde_json;
-    use std::net::UdpSocket;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    // Type alias for the send callback (QUIC datagram delivery).
+    type SendFn = Box<dyn Fn(Vec<u8>) + Send + Sync + 'static>;
 
     // ─── Measurement state ────────────────────────────────────────────────
 
     struct Measurement {
         // Configuration
-        server_addr: String,
-        server_port: u16,
         interval_ms: u64,
         min_interval_ms: u64,
 
@@ -96,8 +118,8 @@ mod imp {
         reports_sent: u64,
         lost_total: u64,
 
-        // Socket for feedback datagrams
-        sock: Option<UdpSocket>,
+        // Monotonic sequence counter for CDBC_FEEDBACK datagrams
+        feedback_seq: u32,
 
         // Last computed feedback (for property reads)
         last_fb: CdbcFeedback,
@@ -106,8 +128,6 @@ mod imp {
     impl Default for Measurement {
         fn default() -> Self {
             Measurement {
-                server_addr: "127.0.0.1".into(),
-                server_port: DEFAULT_PORT,
                 interval_ms: 50,
                 min_interval_ms: 10,
                 last_send: Instant::now(),
@@ -120,7 +140,7 @@ mod imp {
                 bw_window_start: Instant::now(),
                 reports_sent: 0,
                 lost_total: 0,
-                sock: None,
+                feedback_seq: 0,
                 last_fb: CdbcFeedback::default(),
             }
         }
@@ -128,9 +148,26 @@ mod imp {
 
     // ─── GObject subclass ─────────────────────────────────────────────────
 
-    #[derive(Default)]
     pub struct FluxCdbc {
         meas: Mutex<Measurement>,
+        /// QUIC-datagram send callback; None until set_send_callback() is called.
+        send_fn: Arc<Mutex<Option<SendFn>>>,
+    }
+
+    impl Default for FluxCdbc {
+        fn default() -> Self {
+            FluxCdbc {
+                meas: Mutex::new(Measurement::default()),
+                send_fn: Arc::new(Mutex::new(None)),
+            }
+        }
+    }
+
+    impl FluxCdbc {
+        /// Called from the public wrapper to install the QUIC send callback.
+        pub(super) fn set_send_fn(&self, f: SendFn) {
+            *self.send_fn.lock().unwrap() = Some(f);
+        }
     }
 
     #[glib::object_subclass]
@@ -145,16 +182,6 @@ mod imp {
             static PROPS: std::sync::OnceLock<Vec<glib::ParamSpec>> = std::sync::OnceLock::new();
             PROPS.get_or_init(|| {
                 vec![
-                    glib::ParamSpecString::builder("server-address")
-                        .nick("Server address")
-                        .blurb("IP of the FLUX server to send CDBC feedback to")
-                        .default_value(Some("127.0.0.1"))
-                        .build(),
-                    glib::ParamSpecUInt::builder("server-port")
-                        .nick("Server port")
-                        .blurb("UDP port of the FLUX server")
-                        .default_value(DEFAULT_PORT as u32)
-                        .build(),
                     glib::ParamSpecUInt64::builder("cdbc-interval")
                         .nick("CDBC interval ms")
                         .blurb("Normal feedback interval in milliseconds (STABLE/PROBE/RAMP_UP)")
@@ -198,8 +225,6 @@ mod imp {
         fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
             let mut m = self.meas.lock().unwrap();
             match pspec.name() {
-                "server-address" => m.server_addr = value.get::<String>().unwrap(),
-                "server-port" => m.server_port = value.get::<u32>().unwrap() as u16,
                 "cdbc-interval" => m.interval_ms = value.get::<u64>().unwrap(),
                 "cdbc-min-interval" => m.min_interval_ms = value.get::<u64>().unwrap(),
                 _ => {}
@@ -209,8 +234,6 @@ mod imp {
         fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
             let m = self.meas.lock().unwrap();
             match pspec.name() {
-                "server-address" => m.server_addr.to_value(),
-                "server-port" => (m.server_port as u32).to_value(),
                 "cdbc-interval" => m.interval_ms.to_value(),
                 "cdbc-min-interval" => m.min_interval_ms.to_value(),
                 "loss-pct" => m.last_fb.loss_pct.to_value(),
@@ -270,18 +293,12 @@ mod imp {
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
 
         fn start(&self) -> Result<(), gst::ErrorMessage> {
-            let mut m = self.meas.lock().unwrap();
-            let sock = UdpSocket::bind("0.0.0.0:0")
-                .map_err(|e| gst::error_msg!(gst::ResourceError::Failed, ["CDBC socket: {}", e]))?;
-            m.sock = Some(sock);
             // Enable passthrough mode: we only observe, never modify buffers.
             self.obj().set_passthrough(true);
             Ok(())
         }
 
         fn stop(&self) -> Result<(), gst::ErrorMessage> {
-            let mut m = self.meas.lock().unwrap();
-            m.sock = None;
             Ok(())
         }
 
@@ -363,12 +380,18 @@ mod imp {
                     fps_actual: 0.0,
                     datagram_drop_count: m.lost_count,
                     probe_result_bps: 0,
+                    preferred_max_layer: None,
+                    per_channel: None,
                 };
 
                 m.last_fb = fb.clone();
 
-                if let Some(ref sock) = m.sock {
+                // Grab the send callback (if installed) under a brief lock.
+                let send_fn_guard = self.send_fn.lock().unwrap();
+                if let Some(ref send_fn) = *send_fn_guard {
                     let json = serde_json::to_vec(&fb).unwrap_or_default();
+                    let seq = m.feedback_seq;
+                    m.feedback_seq = m.feedback_seq.wrapping_add(1);
                     let fb_hdr = FluxHeader {
                         version: flux_framing::FLUX_VERSION,
                         frame_type: FrameType::CdbcFeedbackT,
@@ -382,20 +405,19 @@ mod imp {
                         capture_ts_ns_lo: 0,
                         payload_length: json.len() as u32,
                         fec_group: 0,
-                        sequence_in_group: 0,
+                        sequence_in_group: seq,
                     };
                     let mut pkt = Vec::with_capacity(HEADER_SIZE + json.len());
                     pkt.extend_from_slice(&fb_hdr.encode());
                     pkt.extend_from_slice(&json);
 
-                    let dst = format!("{}:{}", m.server_addr, m.server_port);
-                    let _ = sock.send_to(&pkt, &dst);
+                    send_fn(pkt);
                     m.reports_sent += 1;
 
                     gst::debug!(
                         gst::CAT_DEFAULT,
-                        "CDBC_FEEDBACK → {} | loss={:.1}% jitter={:.2}ms rx={}bps",
-                        dst,
+                        "CDBC_FEEDBACK seq={} | loss={:.1}% jitter={:.2}ms rx={}bps",
+                        seq,
                         loss_pct,
                         m.jitter_ms,
                         rx_bps

@@ -84,7 +84,10 @@ fn run() {
         .property("address", "127.0.0.1")
         .property("port", 7400u32)
         .build()
-        .expect("fluxsrc element");
+        .expect("fluxsrc element")
+        .downcast::<gstfluxsrc::FluxSrc>()
+        .expect("fluxsrc downcast");
+    let fluxsrc_elem: &gst::Element = fluxsrc.upcast_ref();
 
     let fluxdemux = gst::ElementFactory::make("fluxdemux")
         .build()
@@ -121,12 +124,21 @@ fn run() {
         .expect("fpsdisplaysink element");
 
     let fluxcdbc = gst::ElementFactory::make("fluxcdbc")
-        .property("server-address", "127.0.0.1")
-        .property("server-port", 7400u32)
         .property("cdbc-interval", 50u64)
         .property("cdbc-min-interval", 10u64)
         .build()
-        .expect("fluxcdbc element");
+        .expect("fluxcdbc element")
+        .downcast::<gstfluxcdbc::FluxCdbc>()
+        .expect("fluxcdbc downcast");
+
+    // Route CDBC_FEEDBACK over QUIC (spec §4.4).
+    {
+        let src_for_cdbc = fluxsrc.clone();
+        fluxcdbc.set_send_callback(move |pkt| {
+            src_for_cdbc.send_datagram(pkt);
+        });
+    }
+    let fluxcdbc_elem: &gst::Element = fluxcdbc.upcast_ref();
 
     let fakesink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
@@ -135,22 +147,22 @@ fn run() {
 
     pipeline
         .add_many([
-            &fluxsrc,
+            fluxsrc_elem,
             &fluxdemux,
             &fluxdeframer,
             &h265parse,
             &vtdec_hw,
             &convert,
             &fpsdisplaysink,
-            &fluxcdbc,
+            fluxcdbc_elem,
             &fakesink,
         ])
         .expect("add elements");
 
-    fluxsrc.link(&fluxdemux).expect("fluxsrc → fluxdemux");
+    fluxsrc_elem.link(&fluxdemux).expect("fluxsrc → fluxdemux");
     // fluxcdbc is passthrough — insert it in-line on media_0 so it observes
     // actual MediaData frames and sends CDBC_FEEDBACK to the server.
-    fluxcdbc
+    fluxcdbc_elem
         .link(&fluxdeframer)
         .expect("fluxcdbc → fluxdeframer");
     fluxdeframer

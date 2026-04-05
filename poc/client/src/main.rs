@@ -27,8 +27,8 @@
 //!   B / b     — NetSim bandwidth: B = +1000 kbps, b = -1000 kbps (0 = off)
 //!   H / ? / h — show this help
 //!
-//! All FLUX-C commands are sent as MetadataFrame (0xC) datagrams over UDP to the
-//! server media port (spec §12 / §14).  The server logs receipt.
+//! All FLUX-C commands are sent as MetadataFrame (0xC) QUIC Datagrams via
+//! `fluxsrc.send_datagram()` to the server (spec §12 / §14).
 
 use glib::ControlFlow;
 use gst::glib;
@@ -111,12 +111,23 @@ fn run(tty: Option<Tty>) {
         .expect("fpsdisplaysink element");
 
     let fluxcdbc = gst::ElementFactory::make("fluxcdbc")
-        .property("server-address", "127.0.0.1")
-        .property("server-port", 7400u32)
         .property("cdbc-interval", 50u64)
         .property("cdbc-min-interval", 10u64)
         .build()
-        .expect("fluxcdbc element");
+        .expect("fluxcdbc element")
+        .downcast::<gstfluxcdbc::FluxCdbc>()
+        .expect("fluxcdbc downcast to FluxCdbc");
+
+    // Route CDBC_FEEDBACK over QUIC (spec §4.4).  Install the send callback
+    // now so it is ready before the pipeline transitions to PLAYING.
+    {
+        let src_for_cdbc = fluxsrc.clone();
+        fluxcdbc.set_send_callback(move |pkt| {
+            src_for_cdbc.send_datagram(pkt);
+        });
+    }
+    // Keep a base-class reference for GStreamer APIs that take &gst::Element.
+    let fluxcdbc_elem: &gst::Element = fluxcdbc.upcast_ref();
 
     let fakesink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
@@ -132,7 +143,7 @@ fn run(tty: Option<Tty>) {
             &vtdec_hw,
             &convert,
             &sink,
-            &fluxcdbc,
+            fluxcdbc_elem,
             &fakesink,
         ])
         .expect("add elements");
@@ -140,7 +151,7 @@ fn run(tty: Option<Tty>) {
     fluxsrc_elem.link(&fluxdemux).expect("fluxsrc → fluxdemux");
     // fluxcdbc is passthrough — it observes raw FLUX frames and sends CDBC_FEEDBACK.
     // Wire it in-line on media_0: fluxcdbc → fluxdeframer → h265parse → ...
-    fluxcdbc
+    fluxcdbc_elem
         .link(&fluxdeframer)
         .expect("fluxcdbc → fluxdeframer");
     fluxdeframer.link(&h265parse).expect("deframer → h265parse");
@@ -330,7 +341,7 @@ fn run(tty: Option<Tty>) {
                         main_loop_ctl.quit();
                         break;
                     }
-                    b's' | b'S' => print_stats(fluxsrc_ctl.upcast_ref(), &fluxcdbc_ctl),
+                    b's' | b'S' => print_stats(fluxsrc_ctl.upcast_ref(), fluxcdbc_ctl.upcast_ref()),
                     b'p' | b'P' => {
                         send_flux_c(
                             flux_framing::FluxControl::ptz(&session_id, 0, 0.0, 0.0, 0.5, 0.5, 1.0),

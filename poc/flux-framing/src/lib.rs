@@ -297,6 +297,11 @@ impl FluxHeader {
 /// Comparisons are performed on 32-bit values (wrapping) to correctly handle
 /// modular arithmetic at the 2³² boundary.  Using 64-bit arithmetic caused
 /// off-by-one errors at the epoch boundary.
+///
+/// NOTE: Reserved for future use.  The current PoC receiver (`fluxdeframer`)
+/// uses `group_timestamp_ns` directly as DTS.  Once a hardware-PTP source
+/// is integrated, wire this into the deframer to recover the true capture ts.
+#[allow(dead_code)]
 pub fn reconstruct_capture_ts(group_ts_ns: u64, capture_ts_lo: u32) -> u64 {
     let c = capture_ts_lo;
     let g_lo = group_ts_ns as u32; // low 32 bits — intentional truncation
@@ -584,6 +589,13 @@ pub struct CdbcFeedback {
     /// Zero if no probe result is available.
     #[serde(default)]
     pub probe_result_bps: u64,
+    /// Maximum scalable layer the client can currently decode (spec §5.2).
+    /// Omitted from JSON when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferred_max_layer: Option<u8>,
+    /// Per-channel feedback map (spec §5.2).  Omitted when None.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub per_channel: Option<serde_json::Value>,
 }
 
 /// KEEPALIVE payload (spec §3.3)
@@ -977,6 +989,10 @@ pub fn now_ns() -> u64 {
 /// macOS limits UDP datagrams to net.inet.udp.maxdgram = 9216 bytes by default.
 /// We use 8192 bytes of payload + 32-byte FLUX header = 8224 bytes total, safely
 /// under the 9216-byte OS limit.
+///
+/// NOTE: Reserved for future datagram-mode delivery.  The current PoC uses
+/// stream-per-AU (one QUIC uni-stream per AU), so fragmentation is not needed.
+#[allow(dead_code)]
 pub const FRAG_MTU: usize = 8_192;
 
 /// Encode `payload` as one or more (header_bytes, chunk) pairs ready to be
@@ -984,6 +1000,10 @@ pub const FRAG_MTU: usize = 8_192;
 /// seq, payload_length = full payload length).
 ///
 /// Returns a `Vec` of fully-serialized datagrams (header ++ chunk).
+///
+/// NOTE: Reserved for future datagram-mode delivery.  The current PoC uses
+/// stream-per-AU (one QUIC uni-stream per AU), so this function is not called.
+#[allow(dead_code)]
 pub fn fragment_encode(hdr: &FluxHeader, payload: &[u8]) -> Vec<Vec<u8>> {
     if payload.len() <= FRAG_MTU {
         // Single unfragmented datagram, frag=0
@@ -1024,7 +1044,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let hdr = FluxHeader::new_media(0, 1, 0, true, 1024, 42);
+        let hdr = FluxHeader::new_media(0, 1, 0, true, 1024, 42, 0, 0);
         let enc = hdr.encode();
         let dec = FluxHeader::decode(&enc).unwrap();
         assert_eq!(dec.version, FLUX_VERSION);
@@ -1144,6 +1164,8 @@ mod tests {
             fps_actual: 60.0,
             datagram_drop_count: 0,
             probe_result_bps: 55_000_000,
+            preferred_max_layer: None,
+            per_channel: None,
         };
         gov.ingest(&probe_report); // PROBE → STABLE, current_bps = 55 Mbps
 

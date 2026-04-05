@@ -545,14 +545,15 @@ mod imp {
             *self.raw_tx.lock().unwrap() = Some(rtx);
 
             // ── Spawn QUIC datagram recv task ─────────────────────────────────
-            // Pulls raw datagrams and forwards them to `raw_tx` channel.
-            // create() reads from `raw_rx`, applies NetSim, then pushes downstream.
+            // Receives server→client QUIC Datagrams (keepalive acks, bandwidth
+            // probes) and forwards them to the `raw_tx` channel.  Media frames
+            // arrive on uni-streams via `run_stream_announce_listener` instead.
             let raw_tx = self.raw_tx.lock().unwrap().clone();
             let stop_flag = self.stop_flag.clone();
             if let Some(raw_tx) = raw_tx {
                 let conn_for_recv = connection.clone();
                 rt.spawn(async move {
-                    run_recv_task(conn_for_recv, raw_tx, stop_flag).await;
+                    run_datagram_recv_task(conn_for_recv, raw_tx, stop_flag).await;
                 });
             }
 
@@ -641,13 +642,16 @@ mod imp {
                     if s.last_ka_sent.elapsed() >= s.ka_interval {
                         if let Some(ref conn) = s.connection.clone() {
                             let sid = s.session_id.clone();
-                            let ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
                             let ka_payload = KeepalivePayload {
                                 ts_ns: now_ns(),
                                 session_id: sid,
                                 seq: s.keepalive_seq,
                             };
                             let ka_json = serde_json::to_vec(&ka_payload).unwrap();
+                            // Build the header *after* serialising the body so
+                            // payload_length is correct (spec §3.3).
+                            let mut ka_hdr = FluxHeader::new_keepalive(0, s.keepalive_seq);
+                            ka_hdr.payload_length = ka_json.len() as u32;
                             let mut pkt = Vec::with_capacity(HEADER_SIZE + ka_json.len());
                             pkt.extend_from_slice(&ka_hdr.encode());
                             pkt.extend_from_slice(&ka_json);
@@ -870,7 +874,11 @@ mod imp {
 
     // ─── QUIC recv task ───────────────────────────────────────────────────────
 
-    async fn run_recv_task(
+    /// Receives server→client QUIC Datagrams and forwards them to the raw_tx
+    /// channel.  In the current PoC the server only uses QUIC datagrams for
+    /// keepalive acknowledgements and bandwidth probes; media AUs arrive on
+    /// unidirectional streams handled by `run_stream_announce_listener`.
+    async fn run_datagram_recv_task(
         conn: quinn::Connection,
         tx: std::sync::mpsc::SyncSender<Vec<u8>>,
         stop_flag: Arc<AtomicU32>,
