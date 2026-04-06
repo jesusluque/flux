@@ -1,0 +1,16 @@
+[package]
+name        = "gst-fluxsync"
+version     = "0.1.0"
+edition     = "2021"
+description = "FLUX MSS sync-barrier element (GstAggregator, pre-decoder)"
+
+[lib]
+name       = "gstfluxsync"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+gstreamer      = { workspace = true }
+gstreamer-base = { workspace = true }
+flux-framing   = { path = "../flux-framing" }
+log            = { workspace = true }
+lazy_static    = { workspace = true }

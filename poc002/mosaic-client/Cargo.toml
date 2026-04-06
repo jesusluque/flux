@@ -1,0 +1,24 @@
+[package]
+name    = "mosaic-client"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flux-mosaic-client"
+path = "src/main.rs"
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-video = { workspace = true }
+flux-framing    = { workspace = true }
+env_logger      = { workspace = true }
+log             = { workspace = true }
+libc            = { workspace = true }
+
+# Plugin libs statically linked
+gst-fluxsrc      = { workspace = true }
+gst-fluxdemux    = { workspace = true }
+gst-fluxdeframer = { workspace = true }
+gst-fluxcdbc     = { workspace = true }
+gst-fluxsync     = { workspace = true }

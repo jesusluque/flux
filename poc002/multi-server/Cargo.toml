@@ -1,0 +1,22 @@
+[package]
+name    = "multi-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "flux-multi-server"
+path = "src/main.rs"
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-video = { workspace = true }
+flux-framing    = { workspace = true }
+env_logger      = { workspace = true }
+log             = { workspace = true }
+libc            = { workspace = true }
+ctrlc           = { workspace = true }
+
+# Plugin libs statically linked
+gst-fluxframer = { workspace = true }
+gst-fluxsink   = { workspace = true }
