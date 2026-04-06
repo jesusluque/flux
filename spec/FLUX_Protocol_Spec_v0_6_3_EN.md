@@ -1,10 +1,20 @@
-# FLUX Protocol Specification v0.6.2
+# FLUX Protocol Specification v0.6.3
 
 ## Fabric for Low-latency Unified eXchange
 
 **Status:** Draft — LUCAB Internal
 **Revision:** 2026-04-05
 **Author:** LUCAB Media Technology
+
+**Changelog v0.6.3:**
+
+- **§10.10** — **New section: `flux://` URI scheme for live video textures in GLB**
+  - glTF `image.uri` convention: `flux://channel/{channel_id}` binds a GLB texture to a live FLUX video channel
+  - Fallback behaviour for non-FLUX renderers (static `bufferView` placeholder)
+  - Precedence rules with `video_texture_bindings` (§10.8)
+- §10 FLUX/M constraints table — row added for `flux://` image URIs
+- §16 (amendment) — `fluxvideotex` URI resolution note added
+- §19 — v0.6.3 backward-compatibility notes added
 
 **Changelog v0.6.2:**
 
@@ -93,7 +103,7 @@
 |OMT           |TCP                            |Reliable                              |Receiver hint    |No               |DNS-SD               |No      |No                                               |No                           |No     |No               |
 |NDI           |TCP+UDP                        |Mixed                                 |Receiver hint    |No               |DNS-SD               |XML     |No                                               |Partial                      |Bridge |No               |
 |SMPTE 2110    |RTP/UDP                        |Unreliable                            |None             |PTP (hardware)   |SDP/DNS-SD           |No      |No                                               |None                         |No     |Yes (native)     |
-|**FLUX/QUIC** |**QUIC Datagram+Stream**       |**Unreliable media, reliable control**|**CDBC**         |**PTP sub-ms**   |**DNS-SD + Registry**|**JSON**|**FLUX-E (any MIME, delta, live video tex)**     |**None / TLS 1.3 / TLS+AES** |**Yes**|**No (unicast)**  |
+|**FLUX/QUIC** |**QUIC Datagram+Stream**       |**Unreliable media, reliable control**|**CDBC**         |**PTP sub-ms**   |**DNS-SD + Registry**|**JSON**|**FLUX-E (any MIME, delta, live video tex, flux:// URI)**|**None / TLS 1.3 / TLS+AES** |**Yes**|**No (unicast)**  |
 |**FLUX/M**    |**UDP Multicast (SSM) + RaptorQ**|**Unreliable + proactive FEC**       |**Sender-side**  |**PTP sub-ms**   |**DNS-SD + Registry**|**JSON**|**FLUX-E (session-scoped assets only)**          |**AES-256-GCM (group key)**  |**LAN/MPLS**|**Yes (native)**|
 
 ### The seven pillars
@@ -103,7 +113,7 @@
 3. **FLUX-D** — Discovery: DNS-SD + HTTP/JSON Registry
 4. **FLUX-T** — Bidirectional tally (JSON, compact binary 3-bit)
 5. **FLUX-M** — Automatic monitor stream (confidence sub-stream)
-6. **FLUX-E** — Embedding of arbitrary data in-stream with delta/sequence support and live video texture binding (GLB, USD, GS, CSV, FreeD, EXR…)
+6. **FLUX-E** — Embedding of arbitrary data in-stream with delta/sequence support, live video texture binding, and `flux://` GLB video textures (GLB, USD, GS, CSV, FreeD, EXR…)
 7. **FLUX-C** — Upstream control channel (PTZ, audio mix, routing) with rate limiting
 
 **FLUX/M** (multicast profile) is an eighth operational mode, not a new pillar — it reuses the FLUX framing layer and MSS synchronisation from the seven pillars while replacing the QUIC transport with native IP multicast.
@@ -734,7 +744,7 @@ When the source operates at ≥120 fps, the monitor stream SHOULD be decimated t
 
 ## 10. FLUX-E — Embedding arbitrary data in-stream
 
-FLUX allows any MIME-typed binary payload to be multiplexed into the media stream, with optional temporal association to specific frames. In v0.5, FLUX-E was extended to support live video channel-to-texture binding.
+FLUX allows any MIME-typed binary payload to be multiplexed into the media stream, with optional temporal association to specific frames. In v0.5, FLUX-E was extended to support live video channel-to-texture binding. In v0.6.3, GLB assets can reference FLUX video channels directly via `flux://` URIs in the glTF `image.uri` field (§10.10).
 
 **FLUX/M constraints on FLUX-E:**
 
@@ -748,9 +758,11 @@ FLUX/M supports FLUX-E for session-scoped assets (`frame_assoc.mode = "session"`
 | **GS residual sequences (`queen-v1`)** | ✅ | **⚠️ Supported; loss of residual datagram causes visual artifact until next anchor keyframe. No ARQ. Anchor keyframe interval MUST be ≤ 3 s (§11.7.4).** |
 | `video_texture_bindings` | ✅ | ✅ (binding declared in session descriptor) |
 | `binding_control` delta | ✅ | ✅ (sent on multicast; no ACK) |
+| `feed_uri_override` delta | ✅ | ✅ (sent on multicast; no ACK) |
 | Selective ARQ for EMBED_CHUNK | ✅ | **No** |
 | Cache negotiation (embed_cache in handshake) | ✅ | **No** (session descriptor declares asset list; receiver pre-fetches via HTTP if needed) |
 | **GS codec negotiation (`gs_codecs`)** | ✅ | **No (session descriptor declares `gs_codec` used; no per-receiver negotiation)** |
+| **`flux://` image URIs in GLB** | ✅ | **✅ (channel resolved from multicast session; `channel_id` MUST appear in session descriptor `channels` list)** |
 
 ### 10.1 Supported MIME types
 
@@ -934,6 +946,109 @@ Because FLUX/M has no per-receiver handshake, the server cannot wait for `EMBED_
 ```
 
 Receivers that fail to fetch the anchor before residual frames begin MUST discard all residuals until the next anchor keyframe retransmission (§11.7.4).
+
+---
+
+## 10.10 — `flux://` URI scheme for live video textures in GLB
+
+### §10.10.1 Overview
+
+glTF 2.0 `image` objects support a `uri` field that references the image source. FLUX defines the URI scheme `flux://channel/{channel_id}` to declare that a GLB texture is sourced from a live FLUX video channel rather than from static image data.
+
+This mechanism allows scene authors to embed video feed references directly inside the GLB asset. Any material whose texture chain resolves to a `flux://` image will display live decoded frames from the referenced FLUX channel, synchronised to `GROUP_TIMESTAMP_NS`.
+
+### §10.10.2 URI format
+
+```
+flux://channel/{channel_id}
+```
+
+| Component | Description |
+|---|---|
+| `channel_id` | Unsigned 16-bit integer matching a `CHANNEL_ID` declared via `STREAM_ANNOUNCE` in the active FLUX session. |
+
+Examples: `flux://channel/2`, `flux://channel/5`.
+
+The URI MUST appear in the `uri` field of a glTF `image` object. The `mimeType` field SHOULD be set to `"image/png"` or another valid glTF image MIME type for parser compatibility; FLUX-aware renderers MUST ignore the `mimeType` when a `flux://` URI is present.
+
+### §10.10.3 GLB authoring convention
+
+The GLB SHOULD include a static fallback image via `bufferView` on the same `image` object. Non-FLUX renderers (standard glTF viewers, editing tools) will display the fallback; FLUX-aware renderers MUST ignore `bufferView` when `uri` begins with `flux://`.
+
+```json
+{
+  "images": [
+    {
+      "name": "studio_cam_feed",
+      "uri": "flux://channel/2",
+      "mimeType": "image/png",
+      "bufferView": 3
+    },
+    {
+      "name": "static_logo",
+      "mimeType": "image/png",
+      "bufferView": 4
+    }
+  ]
+}
+```
+
+In this example, `images[0]` resolves to live video from FLUX channel 2 on a FLUX-aware renderer and to the static PNG in `bufferView` 3 on a standard glTF viewer. `images[1]` is a conventional static texture unaffected by this mechanism.
+
+Any number of materials MAY reference the same `flux://` image. The renderer uploads the decoded frame once per `GROUP_TIMESTAMP_NS` and shares the GPU texture across all referencing materials.
+
+### §10.10.4 Receiver behaviour
+
+A FLUX-aware receiver that loads a GLB containing `flux://` image URIs MUST:
+
+1. Parse each `image.uri` and extract `channel_id`.
+2. Verify that the referenced `channel_id` exists in the active session (via `STREAM_ANNOUNCE`). If not, the receiver MUST fall back to the static `bufferView` image and SHOULD log a `FLUX_URI_UNRESOLVED` warning.
+3. For each resolved `flux://` image, substitute the texture source with decoded video frames from the corresponding channel, applying the `color_transform` declared in the channel's `glb_texture_role` (§6.2) if present, or `"none"` otherwise.
+4. Upload the frame to the GPU texture slot before the scene draw call for the associated `GROUP_TIMESTAMP_NS`, following the same synchronisation rules as `video_texture_bindings` (§10.8, §6.2).
+
+If the video channel is temporarily unavailable (jitter buffer miss), the receiver MUST hold the last successfully decoded frame. It MUST NOT revert to the static fallback during transient unavailability.
+
+### §10.10.5 Precedence with `video_texture_bindings`
+
+`video_texture_bindings` (§10.8) is a server-side declaration in `EMBED_MANIFEST`. `flux://` URIs are a scene-side declaration inside the GLB. When both target the same material slot:
+
+1. **`video_texture_bindings` takes precedence.** The `EMBED_MANIFEST` declaration overrides the GLB-internal `flux://` URI for the duration of the binding.
+2. If the `video_texture_bindings` entry is deactivated via `binding_control` (§10.8.7), the `flux://` URI binding resumes automatically.
+3. `texture_swap` delta operations (§10.8.5) override both mechanisms during their declared `frame_assoc` range.
+
+Evaluation order per `GROUP_TIMESTAMP_NS`:
+
+```
+1. Active texture_swap delta for this material + slot? → use static image.
+2. Active video_texture_bindings entry for this material + slot? → use EMBED_MANIFEST binding.
+3. Image has flux:// URI with resolved channel? → use GLB-internal live feed.
+4. None of the above → use GLB static texture.
+```
+
+### §10.10.6 `feed_uri_override` GLB delta operation
+
+A new GLB delta operation type `feed_uri_override` allows the server to remap a `flux://` image URI to a different channel at runtime without re-transmitting the GLB:
+
+```json
+{
+  "op": "feed_uri_override",
+  "image_index": 0,
+  "channel_id": 7
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `image_index` | uint16 | **REQUIRED** | Index into the GLB `images` array. The target image MUST have a `flux://` URI. |
+| `channel_id` | uint16 | **REQUIRED** | New FLUX channel to source. Set to `0xFFFF` to disable the live feed and revert to the static fallback. |
+
+The override persists until a new `feed_uri_override` targets the same `image_index`, or the GLB asset is replaced. Delivery uses the standard GLB delta mechanism (§11.3) with `priority: "realtime"`.
+
+### §10.10.7 FLUX/M considerations
+
+In FLUX/M, the `channel_id` referenced by a `flux://` URI MUST appear in the session descriptor `channels` list. Receivers that encounter a `flux://` URI referencing a channel not present in the session descriptor MUST fall back to the static `bufferView` and log a warning.
+
+`feed_uri_override` deltas are delivered over multicast without acknowledgement, consistent with all FLUX/M delta operations.
 
 ---
 
@@ -1188,7 +1303,7 @@ The `fps` field above reflects the GS sequence render rate (30 fps in this examp
 |`fluxembedsrc`  |Both        |Injects FLUX-E assets into the pipeline                                                                                 |
 |`fluxembeddec`  |Both        |Receives and reassembles assets, emits on downstream pad; routes by `mime_type` (see codec dispatch table below)        |
 |`fluxdeltadec`  |Both        |Applies GLB/GS delta operations to the CPU-side scene graph; emits updated scene state. Does NOT perform GPU uploads.  |
-|`fluxvideotex`  |Both        |Resolves `video_texture_bindings`, composites multi-channel bindings, uploads GPU textures (OpenGL / Vulkan)            |
+|`fluxvideotex`  |Both        |Resolves `video_texture_bindings` and `flux://` image URIs, composites multi-channel bindings, uploads GPU textures (OpenGL / Vulkan)|
 |`fluxcdbc`      |FLUX/QUIC   |Measures BW, generates adaptive CDBC_FEEDBACK                                                                           |
 |`fluxtally`     |Both        |Manages bidirectional tally (JSON + compact binary)                                                                     |
 |`fluxcrypto`    |FLUX/QUIC   |Handles QUIC crypto mode selection (none/quic/quic+aes)                                                                 |
@@ -1201,6 +1316,7 @@ The `fps` field above reflects the GS sequence render rate (30 fps in this examp
 - `fluxmcastsrc` and `fluxmcastsink` handle FLUX/M-specific concerns (multicast join, key management, FEC, FRAG reassembly). Their downstream/upstream pads present the same FLUX frame types as `fluxsrc`/`fluxsink`, so the rest of the pipeline is profile-agnostic.
 - `fluxdeltadec` operates exclusively on CPU-side scene graph state and MUST NOT attempt GPU texture uploads.
 - `fluxvideotex` owns all GPU texture upload and compositing logic.
+- `fluxvideotex` MUST scan loaded GLB `images` arrays for `flux://channel/{id}` URIs and register them as live texture sources alongside any `video_texture_bindings` declared in `EMBED_MANIFEST`. Precedence follows §10.10.5.
 
 ### `fluxgsresidualdec` element (v0.6.1)
 
@@ -2024,6 +2140,18 @@ fluxsrc uri=flux://192.168.1.50:7400 crypto=crypto_quic \
 
 ## 19. Version negotiation and backwards compatibility
 
+### v0.6.3 — `flux://` URI scheme for GLB video textures
+
+The `flux://channel/{channel_id}` URI scheme is an **additive convention** inside GLB assets. It does not affect the FLUX wire protocol, handshake, or session descriptor schema.
+
+**v0.6.2 and earlier receivers** loading a GLB that contains `flux://` URIs in `image.uri` fields: compliant glTF 2.0 parsers will treat the URI as an unresolvable external reference and fall back to the `bufferView` static image (if present) or to a missing-texture placeholder. No session error occurs.
+
+**`feed_uri_override` delta operation:** This is an additive GLB delta type. v0.6.2 receivers that encounter an unknown `op` value in a delta frame MUST silently ignore it per the general FLUX delta parsing rule (§11.3). The live feed will remain bound to the original `channel_id` declared in the GLB URI.
+
+**`flux_version` field:** Sessions using `flux://` URIs in GLB assets SHOULD advertise `"flux_version": "0.6.3"` in `FLUX_SESSION_REQUEST` and FLUX/M Session Descriptors.
+
+---
+
 ### v0.6.2 — FLUX/R Recording Profile
 
 FLUX/R is an **additive offline profile**. It does not affect the live FLUX/QUIC or FLUX/M wire protocol in any way. There is no handshake negotiation for FLUX/R — it is a recording format consumed by dedicated recorder and packager components.
@@ -2577,7 +2705,7 @@ fluxmetaenc
 | Discovery | SDP/NMOS IS-04 | DNS-SD + FLUX Registry |
 | Tally | No | FLUX-T (JSON + compact binary) |
 | 3D / VP assets | No | GLB, USD, GS via FLUX-E |
-| Video texture binding | No | Yes (§10.8) |
+| Video texture binding | No | Yes (§10.8 + `flux://` URI §10.10) |
 | Receiver access control | Network-level only | OAuth 2.0 + epoch key rotation |
 
 FLUX/M is not a replacement for SMPTE 2110 in zero-latency baseband-replacement scenarios (studio production on dedicated 25/100GbE networks). FLUX/M targets contribution and distribution scenarios where encryption, asset embedding, and tally integration are required alongside multicast delivery.
@@ -2655,4 +2783,4 @@ Note: QUEEN GPU decoding is expected to run inside the application renderer (e.g
 
 ---
 
-*FLUX v0.6.2 — LUCAB Media Technology — draft for internal review*
+*FLUX v0.6.3 — LUCAB Media Technology — draft for internal review*
