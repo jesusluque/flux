@@ -12,14 +12,14 @@ gstreamer       = { workspace = true }
 gstreamer-base  = { workspace = true }
 gstreamer-video = { workspace = true }
 gstreamer-app   = { workspace = true }
-flux-framing    = { path = "../flux-framing" }
+flux-framing    = { path = "../../tools/gstreamer/flux-framing" }
 env_logger      = { workspace = true }
 log             = { workspace = true }
 ctrlc           = { workspace = true }
 serde_json      = { workspace = true }
 
 # Pull in our plugin libs so they are linked + registered
-gst-fluxsrc      = { path = "../gst-fluxsrc" }
-gst-fluxdemux    = { path = "../gst-fluxdemux" }
-gst-fluxdeframer = { path = "../gst-fluxdeframer" }
-gst-fluxcdbc     = { path = "../gst-fluxcdbc" }
+gst-fluxsrc      = { path = "../../tools/gstreamer/gst-fluxsrc" }
+gst-fluxdemux    = { path = "../../tools/gstreamer/gst-fluxdemux" }
+gst-fluxdeframer = { path = "../../tools/gstreamer/gst-fluxdeframer" }
+gst-fluxcdbc     = { path = "../../tools/gstreamer/gst-fluxcdbc" }
