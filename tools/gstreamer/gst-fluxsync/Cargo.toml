@@ -2,7 +2,7 @@
 name        = "gst-fluxsync"
 version     = "0.1.0"
 edition     = "2021"
-description = "FLUX MSS sync-barrier element (GstAggregator, pre-decoder)"
+description = "FLUX MSS sync-barrier element (BaseTransform, pre-decoder)"
 
 [lib]
 name       = "gstfluxsync"

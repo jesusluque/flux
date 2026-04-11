@@ -62,6 +62,17 @@ mod imp {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
+    fn cat() -> &'static gst::DebugCategory {
+        static CAT: std::sync::OnceLock<gst::DebugCategory> = std::sync::OnceLock::new();
+        CAT.get_or_init(|| {
+            gst::DebugCategory::new(
+                "fluxdeframer",
+                gst::DebugColorFlags::empty(),
+                Some("FLUX deframer"),
+            )
+        })
+    }
+
     // ── Fragment reassembly state ─────────────────────────────────────────────
     //
     // Spec §4.1 FRAG field encoding:
@@ -73,6 +84,14 @@ mod imp {
     // QUIC datagrams are delivered best-effort and may arrive out of order.
     // We store every received fragment in a BTreeMap keyed by its 1-based index
     // and only emit the reassembled AU once all expected fragments are present.
+
+    // Total downstream latency budget added to every output PTS.
+    //
+    // Covers: vtdec_hw decode time (~100 ms worst case on Apple Silicon)
+    //       + compositor min-upstream-latency window (400 ms, must match)
+    //       + buffer margin.
+    // Must match `min-upstream-latency` set on the compositor in mosaic-client.
+    const TOTAL_LATENCY_NS: u64 = 400_000_000; // 400 ms
 
     struct FragState {
         /// sequence_in_group of the AU being assembled (None = idle).
@@ -89,6 +108,22 @@ mod imp {
         ready: Option<(Vec<u8>, FluxHeader, bool)>,
         /// Carry the DISCONT flag for the AU currently being assembled.
         pending_discont: bool,
+        /// group_timestamp_ns of the very first frame ever seen.
+        /// Used as the origin of our PTS timeline.
+        gts_epoch: Option<u64>,
+        /// GStreamer pipeline running-time (ns) captured when gts_epoch was set.
+        /// The output PTS for frame N is:
+        ///   rt_anchor + (frame_gts - gts_epoch) + TOTAL_LATENCY_NS
+        /// This formula gives:
+        ///   • Monotonically increasing PTS with correct 33ms spacing ✓
+        ///   • Identical PTS across all 4 streams for the same logical frame,
+        ///     because group_timestamp_ns is identical for same-slot frames ✓
+        ///   • PTS always TOTAL_LATENCY_NS ahead of pipeline time when the
+        ///     first frame exits this element, giving vtdec_hw + compositor
+        ///     enough time to decode and render ✓
+        /// Both anchors are preserved across fragment-assembly resets (reconnect
+        /// safety) — only reset explicitly on DISCONT/flush.
+        rt_anchor: Option<u64>,
     }
 
     impl Default for FragState {
@@ -100,6 +135,8 @@ mod imp {
                 total: None,
                 ready: None,
                 pending_discont: false,
+                gts_epoch: None,
+                rt_anchor: None,
             }
         }
     }
@@ -111,6 +148,8 @@ mod imp {
             self.hdr = None;
             self.total = None;
             self.pending_discont = false;
+            // gts_epoch and rt_anchor are intentionally preserved across
+            // assembly resets so reconnects don't re-anchor the clock.
         }
 
         /// Returns true if every expected fragment has arrived.
@@ -187,6 +226,49 @@ mod imp {
                 ]
             })
         }
+
+        fn change_state(
+            &self,
+            transition: gst::StateChange,
+        ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
+            // On resume, reset BOTH rt_anchor AND gts_epoch.
+            //
+            // Why both must be reset:
+            //
+            //   PTS formula: pts = rt_anchor + (gts - gts_epoch) + LATENCY
+            //
+            //   After pause/resume:
+            //     • gts (group_timestamp_ns) is a wall-clock value and keeps
+            //       advancing during the pause — so (gts - gts_epoch) now
+            //       includes the entire pre-pause running time plus the pause
+            //       duration.  This makes PTS enormous (tens of seconds into the
+            //       future), which the compositor silently drops.
+            //     • rt_anchor alone being reset doesn't help: the new rt_anchor
+            //       is small (post-resume running-time), but delta_ns is huge,
+            //       so pts = small + huge + LATENCY is still huge.
+            //
+            //   Correct fix: reset both.  On the next frame after resume:
+            //     gts_epoch = gts   →  delta_ns = 0
+            //     rt_anchor = current_running_time()  →  pts = rt + 0 + LATENCY
+            //   Subsequent frames:
+            //     delta_ns = gts - (new gts_epoch) = 33ms, 66ms, …  ✓
+            //
+            //   Cross-stream PTS alignment is preserved: all 4 fluxdeframer
+            //   instances receive the same group_timestamp_ns for the same
+            //   logical frame, so all 4 will compute the same new gts_epoch
+            //   (within one frame period, since they resume at the same wall-
+            //   clock time) and identical PTS values for each frame pair.
+            if transition == gst::StateChange::PausedToPlaying {
+                let mut st = self.state.lock().unwrap();
+                st.rt_anchor = None;
+                st.gts_epoch = None;
+                gst::debug!(
+                    cat(),
+                    "[fluxdeframer] PausedToPlaying: rt_anchor + gts_epoch reset — will re-anchor on next frame",
+                );
+            }
+            self.parent_change_state(transition)
+        }
     }
 
     impl BaseTransformImpl for FluxDeframer {
@@ -248,7 +330,8 @@ mod imp {
                 // ── Unfragmented AU ───────────────────────────────────────────
                 0x0 => {
                     if st.seq.is_some() {
-                        eprintln!(
+                        gst::warning!(
+                            cat(),
                             "[fluxdeframer] unfragmented seq={} arrived while seq={:?} in progress — discarding old",
                             seq, st.seq
                         );
@@ -263,7 +346,8 @@ mod imp {
                 0xE => {
                     // If this is for a different seq, discard any old assembly.
                     if st.seq.is_some() && st.seq != Some(seq) {
-                        eprintln!(
+                        gst::warning!(
+                            cat(),
                             "[fluxdeframer] last-frag seq={} arrived while assembling seq={:?} — discarding old",
                             seq, st.seq
                         );
@@ -290,7 +374,8 @@ mod imp {
                 n @ 0x1..=0xD => {
                     // If this is for a different seq, discard old assembly.
                     if st.seq.is_some() && st.seq != Some(seq) {
-                        eprintln!(
+                        gst::warning!(
+                            cat(),
                             "[fluxdeframer] frag={} seq={} arrived while assembling seq={:?} — discarding old",
                             n, seq, st.seq
                         );
@@ -349,24 +434,78 @@ mod imp {
             let (payload, hdr, discont) = {
                 let mut st = self.state.lock().unwrap();
                 match st.ready.take() {
-                    Some(triple) => triple,
-                    None => {
-                        return Ok(GenerateOutputSuccess::NoOutput);
-                    }
+                    Some((payload, hdr, discont)) => (payload, hdr, discont),
+                    None => return Ok(GenerateOutputSuccess::NoOutput),
                 }
             };
 
-            // group_timestamp_ns carries the full DTS (== PTS since the server
-            // uses allow-frame-reordering=false).  Use it directly for both PTS
-            // and DTS.  presentation_ts is a u32 90kHz field that overflows after
-            // ~13 hours of uptime — unusable on a machine with ~1000 h uptime.
-            let ts = gst::ClockTime::from_nseconds(hdr.group_timestamp_ns);
-            if hdr.is_keyframe() {
-                eprintln!(
-                    "[fluxdeframer] output buf: keyframe=true group_timestamp_ns={} pts_gst={}",
-                    hdr.group_timestamp_ns, ts,
-                );
-            }
+            // ── PTS formula ───────────────────────────────────────────────────
+            //
+            // We anchor the GStreamer PTS timeline to group_timestamp_ns, which
+            // is the wall-clock value snapped to the 33ms frame grid.  It is
+            // *identical across all 4 streams for the same logical frame* — that
+            // is exactly the property fluxsync exploits for slot keying — so it
+            // is the perfect clock source for cross-stream PTS alignment.
+            //
+            // On the first frame ever:
+            //   gts_epoch = hdr.group_timestamp_ns       (wall-clock origin)
+            //   rt_anchor = current_running_time()       (pipeline clock origin)
+            //
+            // For every frame:
+            //   delta_ns = hdr.group_timestamp_ns - gts_epoch
+            //              (0 for frame 0, 33ms for frame 1, 66ms for frame 2…)
+            //   pts = rt_anchor + delta_ns + TOTAL_LATENCY_NS
+            //
+            // Properties:
+            //   • Monotonically increasing, correct 33ms spacing ✓
+            //   • Identical across all 4 streams for the same frame (same gts) ✓
+            //   • Always TOTAL_LATENCY_NS ahead of clock at first frame exit,
+            //     giving vtdec_hw + compositor time to decode and render ✓
+            //   • gts_epoch/rt_anchor captured once and preserved across
+            //     fragment-assembly resets (reconnect-safe) ✓
+
+            // Capture anchors outside the Mutex (current_running_time needs the
+            // GStreamer element lock, which must not be held while we hold state).
+            let gts = hdr.group_timestamp_ns;
+
+            // Read existing anchors under the lock; capture rt outside.
+            let (gts_epoch_opt, rt_anchor_opt) = {
+                let st = self.state.lock().unwrap();
+                (st.gts_epoch, st.rt_anchor)
+            };
+
+            let (gts_epoch, rt_anchor) = match (gts_epoch_opt, rt_anchor_opt) {
+                (Some(e), Some(a)) => (e, a),
+                _ => {
+                    // First frame: set both anchors.
+                    let rt = self
+                        .obj()
+                        .current_running_time()
+                        .map(|t| t.nseconds())
+                        .unwrap_or(0);
+                    {
+                        let mut st = self.state.lock().unwrap();
+                        st.gts_epoch = Some(gts);
+                        st.rt_anchor = Some(rt);
+                    }
+                    (gts, rt)
+                }
+            };
+
+            let delta_ns = gts.saturating_sub(gts_epoch);
+            let pts_ns = rt_anchor
+                .saturating_add(delta_ns)
+                .saturating_add(TOTAL_LATENCY_NS);
+            let ts = gst::ClockTime::from_nseconds(pts_ns);
+
+            gst::debug!(
+                cat(),
+                "[fluxdeframer] frame: keyframe={} gts={} delta_ns={} pts_gst={}",
+                hdr.is_keyframe(),
+                gts,
+                delta_ns,
+                ts,
+            );
 
             let mut outbuf =
                 gst::Buffer::with_size(payload.len()).map_err(|_| gst::FlowError::Error)?;

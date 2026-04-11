@@ -55,6 +55,17 @@ mod imp {
     use gst_base::subclass::prelude::*;
     use std::sync::Mutex;
 
+    fn cat() -> &'static gst::DebugCategory {
+        static CAT: std::sync::OnceLock<gst::DebugCategory> = std::sync::OnceLock::new();
+        CAT.get_or_init(|| {
+            gst::DebugCategory::new(
+                "fluxframer",
+                gst::DebugColorFlags::empty(),
+                Some("FLUX framer"),
+            )
+        })
+    }
+
     #[derive(Default)]
     struct State {
         seq: u32,
@@ -172,7 +183,8 @@ mod imp {
         /// through to our sink pad so they reach vtenc_h265.  BaseTransform
         /// default does forward them, but this makes it explicit and lets us log.
         fn src_event(&self, event: gst::Event) -> bool {
-            eprintln!(
+            gst::debug!(
+                cat(),
                 "[fluxframer] src_event: type={:?} — forwarding upstream",
                 event.type_()
             );
@@ -189,15 +201,6 @@ mod imp {
 
             let is_keyframe = !inbuf.flags().contains(gst::BufferFlags::DELTA_UNIT);
 
-            if is_keyframe {
-                eprintln!(
-                    "[fluxframer] transform: pts={:?} flags={:?} is_keyframe={}",
-                    inbuf.pts(),
-                    inbuf.flags(),
-                    is_keyframe
-                );
-            }
-
             // Use the buffer's GStreamer PTS/DTS (nanoseconds from pipeline
             // clock origin — starts near 0 at pipeline start).  Falling back
             // to 0 if either is NONE is safe: the client will just show a
@@ -208,6 +211,28 @@ mod imp {
                 .or_else(|| inbuf.pts())
                 .map(|t| t.nseconds())
                 .unwrap_or(0);
+
+            // group_timestamp_ns must be identical for the same frame across all
+            // independent server pipelines so that fluxsync can align them into
+            // the same slot.
+            //
+            // We derive group_ts from the buffer's DTS (pipeline clock, starts
+            // near 0 at pipeline start) rather than wall-clock now_ns().  All 4
+            // pipelines start at the same time with the same 30fps videotestsrc,
+            // so their DTS values are frame_number × 33_333_333 ns and stay in
+            // lockstep regardless of vtenc encoding latency variations.
+            //
+            // Wall-clock now_ns() at transform() time varies by vtenc latency
+            // (which can differ by >16ms between pipelines on the same host),
+            // causing different pipelines to snap to adjacent 33ms grid cells
+            // for the same logical frame — the misalignment we observed.
+            //
+            // Snapping dts_ns to the nearest 33ms boundary eliminates the
+            // ±jitter from minor scheduling differences between pipelines.
+            const FRAME_NS: u64 = 1_000_000_000 / 30; // 33_333_333 ns
+                                                      // Use DTS (falls back to PTS, then 0) — pipeline-clock based, so
+                                                      // identical across all streams for the same logical frame.
+            let group_ts = (dts_ns + FRAME_NS / 2) / FRAME_NS * FRAME_NS;
 
             let mut st = self.state.lock().unwrap();
             st.seq = st.seq.wrapping_add(1);
@@ -220,6 +245,7 @@ mod imp {
                 st.seq,
                 pts_ns,
                 dts_ns,
+                group_ts,
             );
             drop(st);
 

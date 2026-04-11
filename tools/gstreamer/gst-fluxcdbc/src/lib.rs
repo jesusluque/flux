@@ -292,6 +292,29 @@ mod imp {
         const PASSTHROUGH_ON_SAME_CAPS: bool = true;
         const TRANSFORM_IP_ON_PASSTHROUGH: bool = true;
 
+        /// Answer LATENCY queries locally so that the compositor does not log
+        /// "Latency query failed" during startup, before fluxdemux has created
+        /// its dynamic `media_0` pad and linked it to fluxcdbc.sink.
+        ///
+        /// Without this override, BaseTransform's default query handler forwards
+        /// the query upstream through the sink pad, which has no peer at startup
+        /// → the query fails → compositor logs a warning and uses latency=0.
+        fn query(&self, direction: gst::PadDirection, query: &mut gst::QueryRef) -> bool {
+            if direction == gst::PadDirection::Src {
+                if let gst::QueryViewMut::Latency(q) = query.view_mut() {
+                    q.set(
+                        true,
+                        gst::ClockTime::from_mseconds(200),
+                        gst::ClockTime::NONE,
+                    );
+                    return true;
+                }
+            }
+            gstreamer_base::subclass::base_transform::BaseTransformImplExt::parent_query(
+                self, direction, query,
+            )
+        }
+
         fn start(&self) -> Result<(), gst::ErrorMessage> {
             // Enable passthrough mode: we only observe, never modify buffers.
             self.obj().set_passthrough(true);

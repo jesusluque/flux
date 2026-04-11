@@ -133,6 +133,12 @@ impl FluxHeader {
     /// here caused u32 overflow in `presentation_ts` (90 kHz ticks of a wall-
     /// clock timestamp exceed 2³² after ~13 hours, but wrap randomly on a
     /// freshly started pipeline because the Unix epoch offset is already huge).
+    ///
+    /// `group_ts_ns` is the shared sync-group timestamp used by `fluxsync` to
+    /// align frames across streams.  It must be **identical** for the same frame
+    /// across all independent server pipelines — use a wall-clock value snapped
+    /// to the frame-rate grid (e.g. `now_ns()` rounded down to 33_333_333 ns
+    /// for 30 fps) rather than the per-stream DTS.
     pub fn new_media(
         channel_id: u16,
         group_id: u16,
@@ -142,6 +148,7 @@ impl FluxHeader {
         seq: u32,
         pts_ns: u64,
         dts_ns: u64,
+        group_ts_ns: u64,
     ) -> Self {
         // presentation_ts: 90 kHz ticks.  pts_ns is small (pipeline clock),
         // so the conversion and the u32 truncation are safe for sessions up to
@@ -160,9 +167,9 @@ impl FluxHeader {
             layer,
             frag: 0,
             group_id,
-            // group_timestamp_ns carries the full DTS (nanoseconds from
-            // pipeline clock origin) so the receiver can use it as DTS.
-            group_timestamp_ns: dts_ns,
+            // group_timestamp_ns: shared wall-clock frame-grid timestamp so all
+            // streams in the same group land in the same fluxsync slot.
+            group_timestamp_ns: group_ts_ns,
             presentation_ts: pts_90k,
             // capture_ts_ns_lo: low 32 bits of DTS for reconstruct_capture_ts.
             capture_ts_ns_lo: (dts_ns & 0xFFFF_FFFF) as u32,
@@ -1044,7 +1051,7 @@ mod tests {
 
     #[test]
     fn header_roundtrip() {
-        let hdr = FluxHeader::new_media(0, 1, 0, true, 1024, 42, 0, 0);
+        let hdr = FluxHeader::new_media(0, 1, 0, true, 1024, 42, 0, 0, 0);
         let enc = hdr.encode();
         let dec = FluxHeader::decode(&enc).unwrap();
         assert_eq!(dec.version, FLUX_VERSION);

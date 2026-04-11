@@ -66,6 +66,17 @@ mod imp {
     use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
 
+    fn cat() -> &'static gst::DebugCategory {
+        static CAT: std::sync::OnceLock<gst::DebugCategory> = std::sync::OnceLock::new();
+        CAT.get_or_init(|| {
+            gst::DebugCategory::new(
+                "fluxsink",
+                gst::DebugColorFlags::empty(),
+                Some("FLUX sink"),
+            )
+        })
+    }
+
     struct Inner {
         bind_addr: String,
         port: u16,
@@ -283,7 +294,7 @@ mod imp {
                     )
                 })?;
 
-            eprintln!("[fluxsink] QUIC endpoint bound on {} (crypto_quic)", bind_addr);
+            gst::info!(cat(), "[fluxsink] QUIC endpoint bound on {} (crypto_quic)", bind_addr);
 
             // ── Spawn connection-accept + handshake task ──────────────────────
             let conn_slot = s.connection.clone();
@@ -334,7 +345,7 @@ mod imp {
             let data = map.as_slice();
 
             let hdr = FluxHeader::decode(data).ok_or_else(|| {
-                eprintln!("[fluxsink] malformed FLUX header");
+                gst::warning!(cat(), "[fluxsink] malformed FLUX header");
                 gst::FlowError::Error
             })?;
             let payload = &data[HEADER_SIZE..];
@@ -364,13 +375,15 @@ mod imp {
                 let frame_pts = hdr.group_timestamp_ns;
                 let prev = last_sent_pts.load(Ordering::Acquire);
                 if hdr.is_keyframe() {
-                    eprintln!(
+                    gst::debug!(
+                        cat(),
                         "[fluxsink] render: keyframe=true group_ts_ns={} last_sent={}",
                         frame_pts, prev
                     );
                 }
                 if prev > 0 && frame_pts < prev {
-                    eprintln!(
+                    gst::debug!(
+                        cat(),
                         "[fluxsink] drop stale frame pts_ns={} < last_sent_pts_ns={}",
                         frame_pts, prev
                     );
@@ -435,17 +448,17 @@ mod imp {
              rt_handle.spawn(async move {
                  match conn.open_uni().await {
                      Ok(mut uni) => {
-                         if is_kf { eprintln!("[fluxsink] open_uni OK keyframe=true, writing {} bytes", frame_bytes.len()); }
+                         if is_kf { gst::debug!(cat(), "[fluxsink] open_uni OK keyframe=true, writing {} bytes", frame_bytes.len()); }
                          if let Err(e) = uni.write_all(&frame_bytes).await {
-                             eprintln!("[fluxsink] media stream write error: {}", e);
+                             gst::warning!(cat(), "[fluxsink] media stream write error: {}", e);
                          } else if let Err(e) = uni.finish() {
-                             eprintln!("[fluxsink] media stream finish error: {}", e);
+                             gst::warning!(cat(), "[fluxsink] media stream finish error: {}", e);
                          } else if is_kf {
-                             eprintln!("[fluxsink] media stream finished OK keyframe=true");
+                             gst::debug!(cat(), "[fluxsink] media stream finished OK keyframe=true");
                          }
                      }
                      Err(e) => {
-                         eprintln!("[fluxsink] open_uni for media error: {}", e);
+                         gst::warning!(cat(), "[fluxsink] open_uni for media error: {}", e);
                      }
                  }
              });
@@ -474,18 +487,18 @@ mod imp {
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("[fluxsink] QUIC accept error: {}", e);
+                    gst::warning!(cat(), "[fluxsink] QUIC accept error: {}", e);
                     continue;
                 }
             };
 
-            eprintln!("[fluxsink] QUIC connection from {}", conn.remote_address());
+            gst::info!(cat(), "[fluxsink] QUIC connection from {}", conn.remote_address());
 
             // ── SESSION handshake on Stream 0 ─────────────────────────────
             let (mut send, mut recv) = match conn.accept_bi().await {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[fluxsink] accept bidi stream error: {}", e);
+                    gst::warning!(cat(), "[fluxsink] accept bidi stream error: {}", e);
                     continue;
                 }
             };
@@ -494,25 +507,26 @@ mod imp {
             let req: SessionRequest = {
                 let mut len_buf = [0u8; 4];
                 if recv_exact(&mut recv, &mut len_buf).await.is_err() {
-                    eprintln!("[fluxsink] failed to read SessionRequest length");
+                    gst::warning!(cat(), "[fluxsink] failed to read SessionRequest length");
                     continue;
                 }
                 let len = u32::from_be_bytes(len_buf) as usize;
                 let mut body = vec![0u8; len];
                 if recv_exact(&mut recv, &mut body).await.is_err() {
-                    eprintln!("[fluxsink] failed to read SessionRequest body");
+                    gst::warning!(cat(), "[fluxsink] failed to read SessionRequest body");
                     continue;
                 }
                 match serde_json::from_slice(&body) {
                     Ok(r) => r,
                     Err(e) => {
-                        eprintln!("[fluxsink] malformed SessionRequest: {}", e);
+                        gst::warning!(cat(), "[fluxsink] malformed SessionRequest: {}", e);
                         continue;
                     }
                 }
             };
 
-            eprintln!(
+            gst::info!(
+                cat(),
                 "[fluxsink] SESSION_REQUEST — client_id={} codec={:?} max_fps={} cdbc_interval_ms={}",
                 req.client_id, req.codec_support, req.max_fps, req.cdbc_interval_ms,
             );
@@ -530,16 +544,17 @@ mod imp {
             msg.extend_from_slice(&(json.len() as u32).to_be_bytes());
             msg.extend_from_slice(&json);
             if let Err(e) = send.write_all(&msg).await {
-                eprintln!("[fluxsink] write SessionAccept: {}", e);
+                gst::warning!(cat(), "[fluxsink] write SessionAccept: {}", e);
                 continue;
             }
             if let Err(e) = send.finish() {
-                eprintln!("[fluxsink] finish SessionAccept stream: {}", e);
+                gst::warning!(cat(), "[fluxsink] finish SessionAccept stream: {}", e);
                 continue;
             }
 
             *session_id_store.lock().unwrap() = session_id.clone();
-            eprintln!(
+            gst::info!(
+                cat(),
                 "[fluxsink] SESSION_ACCEPT sent — session_id={} peer={}",
                 session_id,
                 conn.remote_address()
@@ -587,18 +602,19 @@ mod imp {
                 match conn.open_uni().await {
                     Ok(mut uni_send) => {
                         if let Err(e) = uni_send.write_all(&msg).await {
-                            eprintln!("[fluxsink] write STREAM_ANNOUNCE: {}", e);
+                            gst::warning!(cat(), "[fluxsink] write STREAM_ANNOUNCE: {}", e);
                         } else if let Err(e) = uni_send.finish() {
-                            eprintln!("[fluxsink] finish STREAM_ANNOUNCE stream: {}", e);
+                            gst::warning!(cat(), "[fluxsink] finish STREAM_ANNOUNCE stream: {}", e);
                         } else {
-                            eprintln!(
+                            gst::info!(
+                                cat(),
                                 "[fluxsink] STREAM_ANNOUNCE sent — ch=0 layer=0 codec=h265 peer={}",
                                 conn.remote_address()
                             );
                         }
                     }
                     Err(e) => {
-                        eprintln!("[fluxsink] open_uni for STREAM_ANNOUNCE failed: {}", e);
+                        gst::warning!(cat(), "[fluxsink] open_uni for STREAM_ANNOUNCE failed: {}", e);
                     }
                 }
             }
@@ -684,7 +700,8 @@ mod imp {
         loop {
             // A4: Exit immediately if a newer client has connected.
             if gen_ref.load(Ordering::Acquire) != my_gen {
-                eprintln!(
+                gst::debug!(
+                    cat(),
                     "[fluxsink/dgram] reader gen={} superseded — exiting",
                     my_gen
                 );
@@ -694,7 +711,7 @@ mod imp {
             let datagram = match conn.read_datagram().await {
                 Ok(d) => d,
                 Err(e) => {
-                    eprintln!("[fluxsink/dgram] read_datagram error: {}", e);
+                    gst::warning!(cat(), "[fluxsink/dgram] read_datagram error: {}", e);
                     *conn_slot.lock().unwrap() = None;
                     break;
                 }
@@ -715,7 +732,8 @@ mod imp {
                     let body = &data[HEADER_SIZE..];
                     match FluxControl::decode_body(body) {
                         Some(ctrl) => {
-                            eprintln!(
+                            gst::debug!(
+                                cat(),
                                 "[fluxsink/ctrl] FLUX-C {:?} from {}",
                                 ctrl.control_type,
                                 conn.remote_address()
@@ -725,7 +743,8 @@ mod imp {
                             }
                         }
                         None => {
-                            eprintln!(
+                            gst::warning!(
+                                cat(),
                                 "[fluxsink/ctrl] unreadable MetadataFrame from {}",
                                 conn.remote_address()
                             );
@@ -738,12 +757,13 @@ mod imp {
                     let fb: CdbcFeedback = match serde_json::from_slice(body) {
                         Ok(f) => f,
                         Err(e) => {
-                            eprintln!("[fluxsink/cdbc] bad CDBC_FEEDBACK: {}", e);
+                            gst::warning!(cat(), "[fluxsink/cdbc] bad CDBC_FEEDBACK: {}", e);
                             continue;
                         }
                     };
 
-                    eprintln!(
+                    gst::debug!(
+                        cat(),
                         "[fluxsink/cdbc] CDBC_FEEDBACK — avail={}bps rx={}bps loss={:.1}% jitter={:.2}ms probe_result={}bps",
                         fb.avail_bps, fb.rx_bps, fb.loss_pct, fb.jitter_ms, fb.probe_result_bps,
                     );
@@ -755,7 +775,7 @@ mod imp {
                         gov.ingest(&fb)
                     };
 
-                    eprintln!("[fluxsink/cdbc] BwGovernor → {:?}", action);
+                    gst::debug!(cat(), "[fluxsink/cdbc] BwGovernor → {:?}", action);
 
                     match action {
                         BwAction::SendProbe => {
@@ -790,35 +810,36 @@ mod imp {
                             pkt.extend_from_slice(&padded);
                             let bytes = Bytes::from(pkt);
                             let _ = conn.send_datagram(bytes);
-                            eprintln!(
+                            gst::debug!(
+                                cat(),
                                 "[fluxsink/cdbc] BANDWIDTH_PROBE #{} sent ({} bytes)",
                                 seq, probe.probe_size
                             );
                         }
                         BwAction::AddLayer => {
-                            eprintln!("[fluxsink/cdbc] ACTION: add enhancement layer");
+                            gst::debug!(cat(), "[fluxsink/cdbc] ACTION: add enhancement layer");
                         }
                         BwAction::DropLayer => {
-                            eprintln!("[fluxsink/cdbc] ACTION: drop top enhancement layer");
+                            gst::debug!(cat(), "[fluxsink/cdbc] ACTION: drop top enhancement layer");
                         }
                         BwAction::EmergencyShed => {
-                            eprintln!("[fluxsink/cdbc] ACTION: EMERGENCY — shed layers");
+                            gst::warning!(cat(), "[fluxsink/cdbc] ACTION: EMERGENCY — shed layers");
                         }
                         BwAction::EnableFec => {
-                            eprintln!("[fluxsink/cdbc] ACTION: enable XOR Row FEC (loss > 5%)");
+                            gst::debug!(cat(), "[fluxsink/cdbc] ACTION: enable XOR Row FEC (loss > 5%)");
                         }
                         BwAction::EnableFecRS => {
-                            eprintln!("[fluxsink/cdbc] ACTION: enable RS 2D FEC (loss > 15%)");
+                            gst::debug!(cat(), "[fluxsink/cdbc] ACTION: enable RS 2D FEC (loss > 15%)");
                         }
                         BwAction::RecoveryRampUp => {
-                            eprintln!("[fluxsink/cdbc] ACTION: EMERGENCY recovery → RAMP_UP");
+                            gst::warning!(cat(), "[fluxsink/cdbc] ACTION: EMERGENCY recovery → RAMP_UP");
                         }
                         BwAction::Hold => {}
                     }
                 }
 
                 FrameType::Keepalive => {
-                    eprintln!("[fluxsink] KEEPALIVE from {}", conn.remote_address());
+                    gst::debug!(cat(), "[fluxsink] KEEPALIVE from {}", conn.remote_address());
                 }
 
                 _ => {}

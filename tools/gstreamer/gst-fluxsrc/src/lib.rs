@@ -86,6 +86,13 @@ mod imp {
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
+    fn cat() -> &'static gst::DebugCategory {
+        static CAT: std::sync::OnceLock<gst::DebugCategory> = std::sync::OnceLock::new();
+        CAT.get_or_init(|| {
+            gst::DebugCategory::new("fluxsrc", gst::DebugColorFlags::empty(), Some("FLUX source"))
+        })
+    }
+
     // ─── NetSim ───────────────────────────────────────────────────────────────
 
     #[derive(Default)]
@@ -186,6 +193,11 @@ mod imp {
         delay_heap: Arc<(Mutex<BinaryHeap<DelayEntry>>, Condvar)>,
         /// Stop flag for the delay thread (and recv task).
         stop_flag: Arc<AtomicU32>,
+        /// Set to 1 when transitioning PausedToPlaying, 0 on PlayingToPaused.
+        /// create() returns FlowError::NoPreroll when this is 0, satisfying
+        /// the GStreamer live-source pre-roll contract (the state machine must
+        /// not block in Paused waiting for a buffer that will never arrive).
+        is_playing: Arc<std::sync::atomic::AtomicU32>,
         /// Raw datagrams from the QUIC recv task → NetSim pipeline.
         /// The recv task pushes here; create() reads and applies NetSim.
         ///
@@ -211,6 +223,7 @@ mod imp {
                 delayed_rx: Mutex::new(Some(drx)),
                 delay_heap: Arc::new((Mutex::new(BinaryHeap::new()), Condvar::new())),
                 stop_flag: Arc::new(AtomicU32::new(0)),
+                is_playing: Arc::new(std::sync::atomic::AtomicU32::new(0)),
                 raw_rx_slot: Mutex::new(Arc::new(Mutex::new(rrx))),
                 raw_tx: Mutex::new(Some(rtx)),
             }
@@ -369,10 +382,14 @@ mod imp {
         ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
             match transition {
                 gst::StateChange::PlayingToPaused => {
+                    // Signal create() to return Flushing immediately.
+                    self.is_playing.store(0, Ordering::SeqCst);
                     // Freeze the session-dead and keepalive clocks while paused.
                     self.inner.lock().unwrap().paused_at = Some(Instant::now());
                 }
                 gst::StateChange::PausedToPlaying => {
+                    // Allow create() to start returning real buffers.
+                    self.is_playing.store(1, Ordering::SeqCst);
                     // Advance last_rx and last_ka_sent by the time spent paused
                     // so the timers behave as if time did not pass.
                     let mut s = self.inner.lock().unwrap();
@@ -381,10 +398,24 @@ mod imp {
                         s.last_rx += frozen;
                         s.last_ka_sent += frozen;
                     }
+                    // Mark that the next buffer must carry DISCONT so that
+                    // h265parse and vtdec_hw flush their GOP state.  While
+                    // paused the server kept encoding; the first post-resume
+                    // buffer is mid-GOP, so vtdec_hw will error on it until
+                    // the next IDR.  DISCONT tells h265parse to reset and wait
+                    // for the next IDR before passing anything to vtdec_hw.
+                    s.pending_discont = true;
                 }
                 _ => {}
             }
-            self.parent_change_state(transition)
+            let ret = self.parent_change_state(transition)?;
+            // For live sources, ReadyToPaused must return NoPreroll so that the
+            // GStreamer state machine does not wait for a pre-roll buffer that
+            // will only arrive once the pipeline is Playing.
+            if transition == gst::StateChange::ReadyToPaused {
+                return Ok(gst::StateChangeSuccess::NoPreroll);
+            }
+            Ok(ret)
         }
     }
 
@@ -395,6 +426,21 @@ mod imp {
 
         fn caps(&self, _filter: Option<&gst::Caps>) -> Option<gst::Caps> {
             Some(gst::Caps::builder("application/x-flux").build())
+        }
+
+        /// Respond to GST_QUERY_LATENCY: we are a live source with min=200ms.
+        /// Without this, compositor logs "Latency query failed" on every frame
+        /// and falls back to latency=0, which can cause partial mosaics.
+        fn query(&self, query: &mut gst::QueryRef) -> bool {
+            if let gst::QueryViewMut::Latency(q) = query.view_mut() {
+                q.set(
+                    true,                                          // is_live
+                    gst::ClockTime::from_mseconds(200),            // min_latency
+                    gst::ClockTime::NONE,                          // max_latency (unknown)
+                );
+                return true;
+            }
+            gstreamer_base::subclass::base_src::BaseSrcImplExt::parent_query(self, query)
         }
 
         fn start(&self) -> Result<(), gst::ErrorMessage> {
@@ -471,7 +517,8 @@ mod imp {
                     )
                 })?;
 
-            eprintln!(
+            gst::info!(
+                cat(),
                 "[fluxsrc] QUIC connected to {} (crypto_quic)",
                 connection.remote_address()
             );
@@ -514,7 +561,8 @@ mod imp {
             });
 
             if let Some(ref a) = accept {
-                eprintln!(
+                gst::info!(
+                    cat(),
                     "[fluxsrc] SESSION_ACCEPT — session_id={} ka_interval_ms={} ka_timeout_count={}",
                     a.session_id, a.keepalive_interval_ms, a.keepalive_timeout_count,
                 );
@@ -630,7 +678,8 @@ mod imp {
                     if s.first_rx_seen && s.ka_timeout_count > 0 {
                         let deadline = s.ka_interval.saturating_mul(s.ka_timeout_count);
                         if s.last_rx.elapsed() > deadline {
-                            eprintln!(
+                            gst::warning!(
+                                cat(),
                                 "[fluxsrc] session '{}' dead — no datagrams for {:?}",
                                 s.session_id,
                                 s.last_rx.elapsed()
@@ -796,7 +845,7 @@ mod imp {
             let mut recv = match conn.accept_uni().await {
                 Ok(r) => r,
                 Err(e) => {
-                    eprintln!("[fluxsrc/uni] accept_uni error: {}", e);
+                    gst::warning!(cat(), "[fluxsrc/uni] accept_uni error: {}", e);
                     break;
                 }
             };
@@ -809,14 +858,15 @@ mod imp {
                     Ok(Some(n)) => data.extend_from_slice(&chunk_buf[..n]),
                     Ok(None) => break, // stream finished (EOF)
                     Err(e) => {
-                        eprintln!("[fluxsrc/uni] read error on uni stream: {}", e);
+                        gst::warning!(cat(), "[fluxsrc/uni] read error on uni stream: {}", e);
                         break;
                     }
                 }
             }
 
             if data.len() < HEADER_SIZE {
-                eprintln!(
+                gst::warning!(
+                    cat(),
                     "[fluxsrc/uni] uni stream too short ({} bytes) — skipping",
                     data.len()
                 );
@@ -826,7 +876,7 @@ mod imp {
             let hdr = match FluxHeader::decode(&data) {
                 Some(h) => h,
                 None => {
-                    eprintln!("[fluxsrc/uni] could not decode FLUX header — skipping");
+                    gst::warning!(cat(), "[fluxsrc/uni] could not decode FLUX header — skipping");
                     continue;
                 }
             };
@@ -835,35 +885,38 @@ mod imp {
 
             match hdr.frame_type {
                 flux_framing::FrameType::MediaData => {
-                    if hdr.is_keyframe() {
-                        eprintln!(
-                            "[fluxsrc/uni] MediaData keyframe=true group_ts_ns={} len={}",
-                            hdr.group_timestamp_ns, data.len()
-                        );
-                    }
+                    gst::info!(
+                        cat(),
+                        "[fluxsrc/uni] MediaData len={} keyframe={} seq={}",
+                        data.len(), hdr.is_keyframe(), hdr.sequence_in_group
+                    );
                     // Forward to the GStreamer pipeline via raw_tx.
                     if let Some(ref tx) = raw_tx {
                         if tx.try_send(data).is_err() {
-                            eprintln!("[fluxsrc/uni] raw_tx full or closed — frame dropped");
+                            gst::warning!(cat(), "[fluxsrc/uni] raw_tx full or closed — frame dropped");
                         }
+                    } else {
+                        gst::warning!(cat(), "[fluxsrc/uni] raw_tx is None — frame dropped");
                     }
                 }
                 flux_framing::FrameType::StreamAnnounce => {
                     match serde_json::from_slice::<StreamAnnounce>(payload) {
                         Ok(sa) => {
-                            eprintln!(
+                            gst::info!(
+                                cat(),
                                 "[fluxsrc] STREAM_ANNOUNCE — ch={} layer={} codec={} name={:?} rate={} res={}",
                                 sa.channel_id, sa.layer_id, sa.codec, sa.name,
                                 sa.frame_rate, sa.resolution,
                             );
                         }
                         Err(e) => {
-                            eprintln!("[fluxsrc] malformed STREAM_ANNOUNCE payload: {}", e);
+                            gst::warning!(cat(), "[fluxsrc] malformed STREAM_ANNOUNCE payload: {}", e);
                         }
                     }
                 }
                 other => {
-                    eprintln!(
+                    gst::debug!(
+                        cat(),
                         "[fluxsrc/uni] unexpected frame type {:?} on uni stream — ignoring",
                         other
                     );
@@ -894,7 +947,7 @@ mod imp {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[fluxsrc/recv] read_datagram error: {}", e);
+                    gst::warning!(cat(), "[fluxsrc/recv] read_datagram error: {}", e);
                     break;
                 }
             }
@@ -919,9 +972,18 @@ mod imp {
         /// `fluxdeframer` element downstream owns reassembly; doing it in two
         /// places simultaneously (B6) caused race conditions and dead code.
         fn push_data(&self, data: Vec<u8>) -> Result<Option<gst::Buffer>, FlowError> {
-            if FluxHeader::decode(&data).is_none() {
-                return Ok(None); // discard undecodable datagrams silently
-            }
+            let hdr = match FluxHeader::decode(&data) {
+                Some(h) => h,
+                None => {
+                    gst::debug!(cat(), "[fluxsrc/push] FluxHeader::decode failed len={} — dropped", data.len());
+                    return Ok(None);
+                }
+            };
+            gst::info!(
+                cat(),
+                "[fluxsrc/push] building GstBuffer frame_type={:?} len={}",
+                hdr.frame_type, data.len()
+            );
 
             let len = data.len();
             let mut buf = gst::Buffer::with_size(len).map_err(|_| FlowError::Error)?;

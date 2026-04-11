@@ -131,6 +131,27 @@ mod imp {
     impl GstObjectImpl for FluxDemux {}
 
     impl ElementImpl for FluxDemux {
+        /// Answer LATENCY queries at the element level so compositor doesn't log
+        /// "Latency query failed" during the startup window before any QUIC
+        /// connection arrives and before the `media_0` src pad is created.
+        ///
+        /// The query travels upstream from compositor through tile/vtdec/h265parse/
+        /// fluxdeframer/fluxsync/sync_queue/fluxcdbc and into the `media_0` src pad.
+        /// If `media_0` doesn't yet exist (no connection yet), GStreamer falls back
+        /// to querying the element itself; we answer here with the same values the
+        /// src pad query function uses.
+        fn query(&self, query: &mut gst::QueryRef) -> bool {
+            if let gst::QueryViewMut::Latency(q) = query.view_mut() {
+                q.set(
+                    true,
+                    gst::ClockTime::from_mseconds(200),
+                    gst::ClockTime::NONE,
+                );
+                return true;
+            }
+            self.parent_query(query)
+        }
+
         fn metadata() -> Option<&'static gst::subclass::ElementMetadata> {
             static META: std::sync::OnceLock<gst::subclass::ElementMetadata> =
                 std::sync::OnceLock::new();
@@ -254,6 +275,30 @@ mod imp {
                 if let Some(tmpl) = tmpl {
                     let new_pad = gst::Pad::builder_from_template(&tmpl)
                         .name(pad_name)
+                        // Answer LATENCY queries on src pads so that downstream
+                        // aggregators (compositor) don't log "Latency query failed".
+                        // We report live=true, min=200ms (matching fluxsrc's answer),
+                        // max=unlimited.  Without this the query reaches fluxdemux's
+                        // default element handler, which tries to forward it upstream
+                        // through the sink pad but the path is blocked because fluxsrc
+                        // is a PushSrc and fluxdemux is a plain Element — the query
+                        // never gets answered and compositor falls back to latency=0.
+                        .query_function(|pad, parent, query| {
+                            if let gst::QueryViewMut::Latency(q) = query.view_mut() {
+                                let _ = (pad, parent); // suppress unused warnings
+                                q.set(
+                                    true,
+                                    gst::ClockTime::from_mseconds(200),
+                                    gst::ClockTime::NONE,
+                                );
+                                return true;
+                            }
+                            gst::Pad::query_default(
+                                pad,
+                                parent.map(|p| p.upcast_ref::<gst::Object>()),
+                                query,
+                            )
+                        })
                         .build();
                     new_pad.set_active(true).ok();
 
