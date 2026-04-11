@@ -87,12 +87,11 @@ mod imp {
 
     // Total downstream latency budget added to every output PTS.
     //
-    // Covers: fluxsync alignment window (500 ms)
-    //       + vtdec_hw decode time (~100 ms worst case on Apple Silicon)
-    //       + compositor aggregation + margin.
-    // Must match `min-upstream-latency` set on the compositor in mosaic-client
-    // AND COMPOSITOR_LATENCY_NS in mosaic-client/src/main.rs.
-    const TOTAL_LATENCY_NS: u64 = 900_000_000; // 900 ms
+    // Covers: vtdec_hw decode time (~100 ms worst case on Apple Silicon)
+    //       + compositor min-upstream-latency window (400 ms, must match)
+    //       + buffer margin.
+    // Must match `min-upstream-latency` set on the compositor in mosaic-client.
+    const TOTAL_LATENCY_NS: u64 = 400_000_000; // 400 ms
 
     struct FragState {
         /// sequence_in_group of the AU being assembled (None = idle).

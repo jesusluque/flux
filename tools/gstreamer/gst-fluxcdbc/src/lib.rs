@@ -304,7 +304,7 @@ mod imp {
                 if let gst::QueryViewMut::Latency(q) = query.view_mut() {
                     q.set(
                         true,
-                        gst::ClockTime::from_mseconds(500),
+                        gst::ClockTime::from_mseconds(200),
                         gst::ClockTime::NONE,
                     );
                     return true;

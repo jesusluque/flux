@@ -185,7 +185,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const DEFAULT_LATENCY_MS: u64 = 500;
+    const DEFAULT_LATENCY_MS: u64 = 200;
     /// Short polling interval for the condvar wait loop (ms).
     /// Bounds per-frame stall when a stream is artificially delayed.
     const CHECK_INTERVAL_MS: u64 = 10;
