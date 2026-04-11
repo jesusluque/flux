@@ -5,14 +5,16 @@
 //! (spec §6.3) on each stream before decoding.
 //!
 //! Per-stream receive pipeline (stream N):
-//!   fluxsrc(port=740N)
+//!   fluxsrc(port=740N, sim-delay-ms=0)
 //!     → fluxdemux
-//!         media_0 → fluxcdbc (passthrough, sends CDBC_FEEDBACK)
-//!                     → fluxsync(group=1, stream=N, nstreams=4)
+//!         media_0 → fluxcdbc
+//!                     → sync_queue
+//!                     → fluxsync(group=1, stream=N, nstreams=4, latency=500)
 //!                     → fluxdeframer
 //!                     → h265parse
 //!                     → vtdec_hw
 //!                     → videoconvertscale
+//!                     → capsfilter(NV12 640×360)
 //!                     → compositor.sink_N
 //!         cdbc → fakesink
 //!
@@ -22,14 +24,18 @@
 //!   sink_2: bottom-left  (  0, 360) 640×360
 //!   sink_3: bottom-right (640, 360) 640×360
 //!
-//! Output: compositor → videoconvertscale → osxvideosink
+//! Output: compositor → capsfilter(NV12 1280×720 30fps) → queue → videoconvertscale → osxvideosink
 //!
 //! ── Keyboard controls ─────────────────────────────────────────────────────────
 //!
-//!   Space   — pause / resume
-//!   Q / q   — quit
-//!   S / s   — print live sync stats per stream
-//!   H / ?   — help (also shown on startup)
+//!   Space     — pause / resume
+//!   1–4       — select stream for delay adjustment
+//!   + / =     — increase sim-delay-ms on selected stream by 10 ms
+//!   -         — decrease sim-delay-ms on selected stream by 10 ms (min 0)
+//!   R / r     — reset all delays to 0
+//!   S / s     — print live sync stats + delay table
+//!   H / ?     — help (shown on startup)
+//!   Q / q     — quit
 
 use gst::glib;
 use gstreamer as gst;
@@ -39,9 +45,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 // ── Serialized stderr logger ──────────────────────────────────────────────────
-//
-// log! expands to multiple write() calls and interleaves across threads.
-// This macro serializes each line into a single write_all() under a global mutex.
 
 static STDERR_LOCK: std::sync::OnceLock<Mutex<std::io::Stderr>> = std::sync::OnceLock::new();
 
@@ -59,9 +62,24 @@ const N: usize = 4;
 const BASE_PORT: u32 = 7400;
 const GROUP_ID: u32 = 1;
 
-// Mosaic tile size.
 const TILE_W: i32 = 640;
 const TILE_H: i32 = 360;
+
+// fluxsync alignment window (ms).
+// Must be >= max useful sim-delay-ms.  We support up to 450 ms of artificial
+// delay; 500 ms gives a 50 ms margin.
+const FLUXSYNC_LATENCY_MS: u64 = 500;
+
+// Total downstream latency budget added to every output PTS by fluxdeframer.
+// Covers: fluxsync alignment window + vtdec_hw decode time + margin.
+// Must match TOTAL_LATENCY_NS in gst-fluxdeframer/src/lib.rs AND
+// min-upstream-latency on the compositor below.
+const COMPOSITOR_LATENCY_NS: u64 = 900_000_000; // 900 ms
+
+// Delay adjustment step (ms).
+const DELAY_STEP_MS: u32 = 10;
+// Maximum sim-delay-ms we allow (ms).
+const MAX_DELAY_MS: u32 = 450;
 
 fn main() {
     env_logger::init();
@@ -81,40 +99,26 @@ fn main() {
 }
 
 fn run(tty: Option<Tty>) {
-    // Register all needed plugins.
     gstfluxsrc::plugin_register_static().expect("fluxsrc register");
     gstfluxdemux::plugin_register_static().expect("fluxdemux register");
     gstfluxdeframer::plugin_register_static().expect("fluxdeframer register");
     gstfluxcdbc::plugin_register_static().expect("fluxcdbc register");
     gstfluxsync::plugin_register_static().expect("fluxsync register");
 
-    // ── Build pipeline ────────────────────────────────────────────────────────
-
     let pipeline = gst::Pipeline::new();
 
-    // ── Output chain: compositor → convert → fpsdisplaysink ──────────────────
+    // ── Output chain ──────────────────────────────────────────────────────────
 
-    // min-upstream-latency must match TOTAL_LATENCY_NS in fluxdeframer (400 ms).
-    // The compositor uses this as its aggregation window: it waits up to this
-    // duration for frames before emitting output.  Setting it equal to the PTS
-    // headroom means the compositor fires exactly when the first frame's PTS is
-    // due.  Must be >= fluxdeframer TOTAL_LATENCY_NS.
     let compositor = gst::ElementFactory::make("compositor")
         .property_from_str("background", "black")
-        .property("min-upstream-latency", 400_000_000u64) // 400 ms — must match fluxdeframer TOTAL_LATENCY_NS
-        // force-live: always operate in live mode and aggregate on timeout.
-        // Without this the aggregator blocks the Paused→Playing transition
-        // waiting for pre-roll buffers that can't arrive until the pipeline
-        // is already Playing (live-source deadlock with dynamic demux pads).
+        // min-upstream-latency: must be >= fluxdeframer TOTAL_LATENCY_NS.
+        // The compositor waits this long for frames before emitting output.
+        .property("min-upstream-latency", COMPOSITOR_LATENCY_NS)
+        // force-live: prevents Paused→Playing deadlock with live sources.
         .property("force-live", true)
         .build()
         .expect("compositor element");
 
-    // Lock compositor output caps to the exact mosaic size (4 × 640×360 = 1280×720)
-    // and a concrete format.  Without this the compositor negotiates prematurely on
-    // the first stream-start event (before any input caps arrive) and fixates to
-    // 1×1 @ 25 fps, after which renegotiation with the real 640×360 NV12 frames
-    // stalls because osxvideosink already accepted 1×1 caps.
     let mosaic_w = TILE_W * 2; // 1280
     let mosaic_h = TILE_H * 2; // 720
     let comp_caps = gst::Caps::builder("video/x-raw")
@@ -128,13 +132,8 @@ fn run(tty: Option<Tty>) {
         .build()
         .expect("compositor capsfilter");
 
-    // Queue between compositor and the rest of the output chain.
-    // Without this, osxvideosink (or any downstream element) blocking on
-    // clock/sync back-pressures directly into compositor's aggregator output
-    // thread.  When that thread is blocked, compositor stops scheduling
-    // aggregation timeouts and ceases to pull from its input pads — freezing
-    // tile_caps_src at the first couple of buffers.  The queue decouples
-    // compositor's output thread so it can always keep aggregating.
+    // Queue decouples compositor's output thread from osxvideosink so the
+    // compositor keeps aggregating even when the sink is blocked on the clock.
     let out_queue = gst::ElementFactory::make("queue")
         .property("max-size-buffers", 4u32)
         .property("max-size-bytes", 0u32)
@@ -146,12 +145,6 @@ fn run(tty: Option<Tty>) {
         .build()
         .expect("output videoconvertscale");
 
-    // sync=false: render frames as fast as they arrive without clock-based
-    // synchronisation.  For a live multi-stream mosaic we never want the
-    // sink to drop or delay frames due to PTS mismatch; the queue above
-    // already decouples us from timing back-pressure.
-    // async=false: do not block Paused→Playing waiting for a pre-roll buffer
-    // (live-source pipeline deadlock).
     let osxvideosink = gst::ElementFactory::make("osxvideosink")
         .name("osxvideosink")
         .property("sync", false)
@@ -182,7 +175,6 @@ fn run(tty: Option<Tty>) {
         .link(&osxvideosink)
         .expect("out_convert → osxvideosink");
 
-    // Request compositor sink pads (one per stream) with position/size.
     let mut comp_sink_pads: Vec<gst::Pad> = Vec::with_capacity(N);
     for i in 0..N {
         let col = (i % 2) as i32;
@@ -199,8 +191,6 @@ fn run(tty: Option<Tty>) {
 
     // ── Per-stream receive elements ───────────────────────────────────────────
 
-    // Probe counters: [stream][probe_point]
-    // probe_points: 0=fluxsrc_src, 1=fluxdeframer_src, 2=vtdec_src, 3=tile_caps_src
     let probe_counts: Vec<[Arc<AtomicU64>; 4]> = (0..N)
         .map(|_| {
             [
@@ -212,13 +202,17 @@ fn run(tty: Option<Tty>) {
         })
         .collect();
 
+    let mut fluxsrc_elems: Vec<gst::Element> = Vec::with_capacity(N);
     let mut fluxsync_elems: Vec<gst::Element> = Vec::with_capacity(N);
 
+    // Per-stream sim-delay-ms state (shared with keyboard handler).
+    let delays: Arc<Mutex<[u32; N]>> = Arc::new(Mutex::new([0u32; N]));
+
     for i in 0..N {
-        // fluxsrc
         let fluxsrc = gst::ElementFactory::make("fluxsrc")
             .property("address", "127.0.0.1")
             .property("port", BASE_PORT + i as u32)
+            .property("sim-delay-ms", 0u32)
             .name(format!("fluxsrc_{}", i).as_str())
             .build()
             .expect("fluxsrc element")
@@ -241,36 +235,21 @@ fn run(tty: Option<Tty>) {
             .expect("fluxcdbc downcast");
         let fluxcdbc_elem = fluxcdbc.upcast::<gst::Element>();
 
-        // Queue between fluxcdbc and fluxsync to decouple the GStreamer
-        // streaming thread (which also runs fluxsrc::create()) from the
-        // blocking condvar wait inside fluxsync::transform_ip().
+        // Queue between fluxcdbc and fluxsync.
         //
-        // Without this queue, fluxsync blocks the streaming thread while
-        // waiting for all 4 streams to deposit into the same slot.  Because
-        // fluxsrc::create() runs on that same thread, the raw_tx channel
-        // backs up (all 4 QUIC recv tasks keep pushing at 30 fps) and frames
-        // are dropped with "raw_tx full or closed".
+        // Decouples the fluxsrc streaming thread from fluxsync's blocking
+        // condvar wait.  leaky=downstream (drop-oldest) ensures that when one
+        // stream's sim-delay-ms exceeds the fluxsync latency window the queue
+        // absorbs the throughput deficit rather than back-pressuring into the
+        // QUIC receive path.
         //
-        // With the queue, the streaming thread (fluxsrc::create) runs freely
-        // up to fluxcdbc, deposits into the queue, and returns immediately.
-        // The queue spawns its own thread which calls chain() on fluxsync —
-        // that thread may block on the condvar, but it never blocks create().
-        //
-        // leaky=downstream (2): when the queue fills, drop the OLDEST buffer
-        // rather than blocking fluxsrc's streaming thread.  This is the
-        // correct behaviour for a live stream under artificial delay: we prefer
-        // to drop old frames (already stale) rather than back-pressuring into
-        // the QUIC receive path and eventually corrupting the H.265 bitstream
-        // with "raw_tx full or closed" drops.
-        //
-        // max-size-buffers=600 (~20 s at 30 fps) gives enough headroom for
-        // delays up to ~500 ms before any dropping occurs, while still
-        // allowing fluxsrc to run freely.
+        // max-size-buffers=600 (~20 s at 30 fps) gives headroom for any
+        // practically useful delay value (≤450 ms << 20 s).
         let sync_queue = gst::ElementFactory::make("queue")
-            .property("max-size-buffers", 600u32) // 20 s at 30 fps
+            .property("max-size-buffers", 600u32)
             .property("max-size-bytes", 0u32)
             .property("max-size-time", 0u64)
-            .property_from_str("leaky", "downstream") // drop-oldest on overflow
+            .property_from_str("leaky", "downstream")
             .name(format!("sync_queue_{}", i).as_str())
             .build()
             .expect("sync queue");
@@ -279,7 +258,7 @@ fn run(tty: Option<Tty>) {
             .property("group", GROUP_ID)
             .property("stream", i as u32)
             .property("nstreams", N as u32)
-            .property("latency", 200u64)
+            .property("latency", FLUXSYNC_LATENCY_MS)
             .name(format!("fluxsync_{}", i).as_str())
             .build()
             .expect("fluxsync element");
@@ -296,12 +275,6 @@ fn run(tty: Option<Tty>) {
 
         let vtdec = gst::ElementFactory::make("vtdec_hw")
             .name(format!("vtdec_{}", i).as_str())
-            // Disable QoS: vtdec_hw honors GstQosEvents from osxvideosink and
-            // drops frames whose PTS is in the past.  At startup the pipeline
-            // clock has already advanced past the PTS of the first few frames
-            // (vtdec's own decode latency can exceed our PTS headroom), so
-            // vtdec would otherwise drop every frame until the PTS catches up.
-            // For a live mosaic we never want decoder-level frame drops.
             .property("qos", false)
             .build()
             .expect("vtdec_hw element");
@@ -311,11 +284,6 @@ fn run(tty: Option<Tty>) {
             .build()
             .expect("videoconvertscale element");
 
-        // Lock each tile to the expected size and format so the compositor sees
-        // consistent caps.  vtdec_hw reports framerate=0/1 (VFR); omit the
-        // framerate field here — videoconvertscale cannot do framerate
-        // conversion, and the compositor's own output capsfilter already pins
-        // the final output to 30 fps.
         let tile_caps = gst::Caps::builder("video/x-raw")
             .field("format", "NV12")
             .field("width", TILE_W)
@@ -349,7 +317,6 @@ fn run(tty: Option<Tty>) {
             ])
             .expect("add stream elements");
 
-        // Static links.
         fluxsrc_elem.link(&fluxdemux).expect("fluxsrc → fluxdemux");
         fluxcdbc_elem
             .link(&sync_queue)
@@ -361,25 +328,17 @@ fn run(tty: Option<Tty>) {
         fluxdeframer
             .link(&h265parse)
             .expect("fluxdeframer → h265parse");
-        // Let h265parse and vtdec_hw negotiate caps freely.
-        // h265parse receives byte-stream from fluxdeframer and will output in
-        // whatever format vtdec_hw's sink pad template accepts.  Using
-        // link_filtered here caused "Failed to link" errors because vtdec_hw's
-        // pad template includes a memory:SystemMemory qualifier that conflicts
-        // with a plain byte-stream caps filter.
         h265parse.link(&vtdec).expect("h265parse → vtdec");
         vtdec.link(&convert).expect("vtdec → convert");
         convert
             .link(&tile_capsfilter)
             .expect("convert → tile_capsfilter");
 
-        // tile_capsfilter src → compositor.sink_i
         let tile_src = tile_capsfilter.static_pad("src").unwrap();
         tile_src
             .link(&comp_sink_pads[i])
             .expect("tile_capsfilter → compositor");
 
-        // Dynamic demux pad routing.
         let cdbc_clone = fluxcdbc_elem.clone();
         let fs_clone = fakesink.clone();
         fluxdemux.connect_pad_added(move |_, pad| match pad.name().as_str() {
@@ -398,26 +357,16 @@ fn run(tty: Option<Tty>) {
             _ => {}
         });
 
-        // ── Pad probes for black-screen diagnostics ───────────────────────────
-        // Count buffers passing each key src pad; printed every 3 s.
-
-        // 0: fluxsrc src pad (first src pad — "src_0" from fluxsrc, or "src")
+        // ── Pad probes ────────────────────────────────────────────────────────
         {
             let cnt = probe_counts[i][0].clone();
-            // fluxsrc exposes a static "src" pad
             if let Some(pad) = fluxsrc_elem.static_pad("src") {
                 pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
                     cnt.fetch_add(1, Ordering::Relaxed);
                     gst::PadProbeReturn::Ok
                 });
-            } else {
-                log!(
-                    "[mosaic-client] stream {}: fluxsrc has no static 'src' pad (dynamic)",
-                    i
-                );
             }
         }
-        // 1: fluxdeframer src pad
         {
             let cnt = probe_counts[i][1].clone();
             if let Some(pad) = fluxdeframer.static_pad("src") {
@@ -427,7 +376,6 @@ fn run(tty: Option<Tty>) {
                 });
             }
         }
-        // 2: vtdec src pad
         {
             let cnt = probe_counts[i][2].clone();
             if let Some(pad) = vtdec.static_pad("src") {
@@ -437,7 +385,6 @@ fn run(tty: Option<Tty>) {
                 });
             }
         }
-        // 3: tile_capsfilter src pad
         {
             let cnt = probe_counts[i][3].clone();
             if let Some(pad) = tile_capsfilter.static_pad("src") {
@@ -448,6 +395,7 @@ fn run(tty: Option<Tty>) {
             }
         }
 
+        fluxsrc_elems.push(fluxsrc_elem);
         fluxsync_elems.push(fluxsync);
     }
 
@@ -457,7 +405,7 @@ fn run(tty: Option<Tty>) {
         .set_state(gst::State::Playing)
         .expect("Unable to start pipeline");
     log!(
-        "[mosaic-client] Started — receiving {} streams, group_id={} (set_state={:?})",
+        "[mosaic-client] Started — {} streams, group_id={} (set_state={:?})",
         N,
         GROUP_ID,
         sc
@@ -469,7 +417,6 @@ fn run(tty: Option<Tty>) {
     let main_loop = glib::MainLoop::new(None, false);
     let paused = Arc::new(AtomicBool::new(false));
 
-    // Bus watcher — must be kept alive until main loop exits.
     let ml = main_loop.clone();
     let pipeline_for_bus = pipeline.clone();
     let bus = pipeline.bus().unwrap();
@@ -502,7 +449,7 @@ fn run(tty: Option<Tty>) {
         })
         .unwrap();
 
-    // ── 3-second diagnostic timer — buffer counts per probe point ────────────
+    // ── 3-second diagnostic timer ─────────────────────────────────────────────
     {
         let pc = probe_counts.clone();
         glib::timeout_add_local(std::time::Duration::from_secs(3), move || {
@@ -512,15 +459,19 @@ fn run(tty: Option<Tty>) {
                 let vt = pc[i][2].load(Ordering::Relaxed);
                 let tc = pc[i][3].load(Ordering::Relaxed);
                 log!(
-                    "[probe] stream {}: fluxsrc_src={:5}  deframer_src={:5}  vtdec_src={:5}  tile_caps_src={:5}",
-                    i, fs, df, vt, tc
+                    "[probe] stream {}: fluxsrc={:5}  deframer={:5}  vtdec={:5}  tile={:5}",
+                    i,
+                    fs,
+                    df,
+                    vt,
+                    tc
                 );
             }
             glib::ControlFlow::Continue
         });
     }
 
-    // Keyboard input: background thread does blocking reads, main loop drains via idle_add_local.
+    // ── Keyboard ──────────────────────────────────────────────────────────────
     if let Some(tty) = tty {
         let (tx, rx) = std::sync::mpsc::channel::<char>();
         std::thread::spawn(move || {
@@ -530,19 +481,8 @@ fn run(tty: Option<Tty>) {
                 let mut buf = [0u8; 1];
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 1) };
                 if n <= 0 {
-                    let err = unsafe { *libc::__error() };
-                    log!(
-                        "[mosaic-client] keyboard thread: read returned {} errno={}",
-                        n,
-                        err
-                    );
                     break;
                 }
-                log!(
-                    "[mosaic-client] key read: 0x{:02x} '{}'",
-                    buf[0],
-                    buf[0] as char
-                );
                 if tx.send(buf[0] as char).is_err() {
                     break;
                 }
@@ -552,8 +492,11 @@ fn run(tty: Option<Tty>) {
 
         let pipeline_weak = pipeline.downgrade();
         let ml = main_loop.clone();
+        let fluxsrc_weak: Vec<_> = fluxsrc_elems.iter().map(|e| e.downgrade()).collect();
         let fluxsync_weak: Vec<_> = fluxsync_elems.iter().map(|e| e.downgrade()).collect();
         let paused_flag = paused.clone();
+        let delays_key = delays.clone();
+        let mut selected: usize = 0;
 
         glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
             while let Ok(ch) = rx.try_recv() {
@@ -578,17 +521,69 @@ fn run(tty: Option<Tty>) {
                         ml.quit();
                         return glib::ControlFlow::Break;
                     }
-                    'D' | 'd' => {
-                        log!("[mosaic-client] FPS overlay not available (fpsdisplaysink removed)");
+                    '1'..='4' => {
+                        selected = ch as usize - '1' as usize;
+                        log!("[mosaic-client] Selected stream {}", selected);
+                    }
+                    '+' | '=' => {
+                        let new_delay = {
+                            let mut d = delays_key.lock().unwrap();
+                            d[selected] = (d[selected] + DELAY_STEP_MS).min(MAX_DELAY_MS);
+                            d[selected]
+                        };
+                        if let Some(src) = fluxsrc_weak[selected].upgrade() {
+                            src.set_property("sim-delay-ms", new_delay);
+                        }
+                        log!(
+                            "[mosaic-client] Stream {} sim-delay → {} ms",
+                            selected,
+                            new_delay
+                        );
+                    }
+                    '-' => {
+                        let new_delay = {
+                            let mut d = delays_key.lock().unwrap();
+                            d[selected] = d[selected].saturating_sub(DELAY_STEP_MS);
+                            d[selected]
+                        };
+                        if let Some(src) = fluxsrc_weak[selected].upgrade() {
+                            src.set_property("sim-delay-ms", new_delay);
+                        }
+                        log!(
+                            "[mosaic-client] Stream {} sim-delay → {} ms",
+                            selected,
+                            new_delay
+                        );
+                    }
+                    'R' | 'r' => {
+                        let mut d = delays_key.lock().unwrap();
+                        for i in 0..N {
+                            d[i] = 0;
+                            if let Some(src) = fluxsrc_weak[i].upgrade() {
+                                src.set_property("sim-delay-ms", 0u32);
+                            }
+                        }
+                        log!("[mosaic-client] All delays reset to 0");
                     }
                     'S' | 's' => {
+                        let d = delays_key.lock().unwrap();
+                        log!("[mosaic-client] Delay table:");
+                        for i in 0..N {
+                            log!(
+                                "  stream {} (port {}): {} ms",
+                                i,
+                                BASE_PORT + i as u32,
+                                d[i]
+                            );
+                        }
+                        drop(d);
                         for (i, sw) in fluxsync_weak.iter().enumerate() {
                             if let Some(s) = sw.upgrade() {
                                 let synced: u64 = s.property("frames-synced");
                                 let dropped: u64 = s.property("frames-dropped");
                                 let skew: u64 = s.property("max-skew-ns");
                                 log!(
-                                    "[mosaic-client] stream {}: synced={} dropped={} max_skew={}µs",
+                                    "[mosaic-client] fluxsync {}: synced={} dropped={} max_skew={}µs",
                                     i,
                                     synced,
                                     dropped,
@@ -629,7 +624,6 @@ impl Drop for Tty {
 
 fn open_tty_raw() -> Option<Tty> {
     let path = std::ffi::CString::new("/dev/tty").unwrap();
-    // Open in blocking mode — reads happen on a dedicated thread.
     let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
     if fd < 0 {
         return None;
@@ -637,10 +631,6 @@ fn open_tty_raw() -> Option<Tty> {
     let mut orig: libc::termios = unsafe { std::mem::zeroed() };
     unsafe { libc::tcgetattr(fd, &mut orig) };
     let mut raw = orig;
-    // cfmakeraw disables OPOST which turns off \n→\r\n mapping, causing
-    // staircase output.  Instead set only the input flags we need manually:
-    // disable canonical mode, echo, and signal generation — but leave output
-    // processing (OPOST / ONLCR) intact so \n still moves to column 0.
     raw.c_lflag &= !(libc::ICANON
         | libc::ECHO
         | libc::ECHOE
@@ -659,7 +649,11 @@ fn print_help() {
     log!(
         "\n[mosaic-client] Keys:\n\
          Space  pause / resume\n\
-         S      print sync stats per stream\n\
+         1–4    select stream for delay adjustment\n\
+         + / =  increase sim-delay on selected stream (10 ms)\n\
+         -      decrease sim-delay on selected stream (10 ms)\n\
+         R      reset all delays to 0\n\
+         S      show delay table + sync stats\n\
          H / ?  show this help\n\
          Q      quit\n"
     );
