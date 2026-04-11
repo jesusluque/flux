@@ -99,6 +99,9 @@ fn run(tty: Option<Tty>) {
     // duration for frames before emitting output.  Setting it equal to the PTS
     // headroom means the compositor fires exactly when the first frame's PTS is
     // due.  Must be >= fluxdeframer TOTAL_LATENCY_NS.
+    // Note: fluxsync latency (60 ms) is NOT included here — fluxsync does not
+    // add latency to the PTS; it only holds buffers in a condvar wait.  The
+    // PTS headroom is set entirely by fluxdeframer's TOTAL_LATENCY_NS.
     let compositor = gst::ElementFactory::make("compositor")
         .property_from_str("background", "black")
         .property("min-upstream-latency", 400_000_000u64) // 400 ms — must match fluxdeframer TOTAL_LATENCY_NS
@@ -279,7 +282,7 @@ fn run(tty: Option<Tty>) {
             .property("group", GROUP_ID)
             .property("stream", i as u32)
             .property("nstreams", N as u32)
-            .property("latency", 200u64)
+            .property("latency", 60u64)
             .name(format!("fluxsync_{}", i).as_str())
             .build()
             .expect("fluxsync element");

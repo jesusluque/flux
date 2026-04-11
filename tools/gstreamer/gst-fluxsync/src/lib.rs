@@ -35,7 +35,7 @@
 //!   group    (u32)   — sync-group identifier (matches server-side group_id)
 //!   stream   (u32)   — 0-based index of this stream within the group
 //!   nstreams (u32)   — total number of streams in the group
-//!   latency  (u64)   — alignment window / eviction timeout in ms (default 200)
+//!   latency  (u64)   — alignment window / eviction timeout in ms (default 60)
 //!
 //! Read-only stats:
 //!   frames-synced (u64), frames-dropped (u64), max-skew-ns (u64)
@@ -185,7 +185,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    const DEFAULT_LATENCY_MS: u64 = 200;
+    const DEFAULT_LATENCY_MS: u64 = 60;
     /// Short polling interval for the condvar wait loop (ms).
     /// Bounds per-frame stall when a stream is artificially delayed.
     const CHECK_INTERVAL_MS: u64 = 10;
