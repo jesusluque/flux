@@ -428,14 +428,14 @@ mod imp {
             Some(gst::Caps::builder("application/x-flux").build())
         }
 
-        /// Respond to GST_QUERY_LATENCY: we are a live source with min=60ms.
+        /// Respond to GST_QUERY_LATENCY: we are a live source with min=200ms.
         /// Without this, compositor logs "Latency query failed" on every frame
         /// and falls back to latency=0, which can cause partial mosaics.
         fn query(&self, query: &mut gst::QueryRef) -> bool {
             if let gst::QueryViewMut::Latency(q) = query.view_mut() {
                 q.set(
                     true,                                          // is_live
-                    gst::ClockTime::from_mseconds(60),             // min_latency
+                    gst::ClockTime::from_mseconds(200),            // min_latency
                     gst::ClockTime::NONE,                          // max_latency (unknown)
                 );
                 return true;
