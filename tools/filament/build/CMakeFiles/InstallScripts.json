@@ -1,0 +1,8 @@
+{
+	"InstallScripts" : 
+	[
+		"/Users/muriel/luc/flux/tools/filament/build/cmake_install.cmake",
+		"/Users/muriel/luc/flux/tools/filament/build/gst-fluxvideotex/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

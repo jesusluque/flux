@@ -1,0 +1,27 @@
+material {
+    name : "VideoTexture",
+    shadingModel : unlit,
+    doubleSided : true,
+    variables : [
+        uv
+    ],
+    parameters : [
+        {
+            type : sampler2d,
+            name : albedo
+        }
+    ]
+}
+
+vertex {
+    void materialVertex(inout MaterialVertexInputs material) {
+        material.uv = getUV0();
+    }
+}
+
+fragment {
+    void material(inout MaterialInputs m) {
+        prepareMaterial(m);
+        m.baseColor = texture(materialParams_albedo, variable_uv);
+    }
+}

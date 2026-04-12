@@ -1,0 +1,12 @@
+# This is a generated file and its contents are an internal implementation detail.
+# The download step will be re-executed if anything in this file changes.
+# No other meaning or use of this file is supported.
+
+method=url
+command=/opt/homebrew/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/Users/muriel/luc/flux/tools/filament/build/_deps/filament_dist-subbuild/filament_dist-populate-prefix/src/filament_dist-populate-stamp/download-filament_dist-populate.cmake;COMMAND;/opt/homebrew/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/Users/muriel/luc/flux/tools/filament/build/_deps/filament_dist-subbuild/filament_dist-populate-prefix/src/filament_dist-populate-stamp/verify-filament_dist-populate.cmake;COMMAND;/opt/homebrew/bin/cmake;-DCMAKE_MESSAGE_LOG_LEVEL=VERBOSE;-P;/Users/muriel/luc/flux/tools/filament/build/_deps/filament_dist-subbuild/filament_dist-populate-prefix/src/filament_dist-populate-stamp/extract-filament_dist-populate.cmake
+source_dir=/Users/muriel/luc/flux/tools/filament/build/_deps/filament_dist-src
+work_dir=/Users/muriel/luc/flux/tools/filament/build/_deps
+url(s)=https://github.com/google/filament/releases/download/v1.71.0/filament-v1.71.0-mac.tgz
+hash=
+      no_extract=
+
