@@ -7,15 +7,24 @@
  *     rendered unit cube, with slow multi-axis rotation over 5 minutes
  *   - osxvideosink displays the rendered output
  *
+ * Usage:
+ *   poc003 [--color-space <mode>] [--ycbcr]
+ *
+ *   --color-space  One of: srgb (default), bt709, rec709-linear,
+ *                          rec2020-linear, rec2020-pq, rec2020-hlg
+ *   --ycbcr        Enable Y'CbCr output encoding (ycbcr-output=true)
+ *   --duration N   Run for N seconds (default 10)
+ *
+ * Without arguments runs in the original 5-minute mode.
+ *
  * Pipeline:
  *   videotestsrc pattern=smpte is-live=true
  *     ! videoconvert
  *     ! video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1
- *     ! fluxvideotex width=1280 height=720
- *     ! video/x-raw,format=RGBA,width=1280,height=720
+ *     ! fluxvideotex width=1280 height=720 color-space=<mode> ycbcr-output=<bool>
+ *     ! video/x-raw,format=<RGBA|AYUV>,width=1280,height=720
+ *     ! videoconvert
  *     ! osxvideosink sync=false
- *
- * Run for 300 seconds (5 minutes) then exit cleanly.  Ctrl-C also works.
  */
 
 #include <gst/gst.h>
@@ -24,9 +33,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-
-/* Demo duration in milliseconds (5 minutes) */
-static const guint DEMO_DURATION_MS = 300U * 1000U;
 
 static GMainLoop* g_loop = nullptr;
 
@@ -70,33 +76,59 @@ static gboolean on_bus_message(GstBus* /*bus*/, GstMessage* msg, gpointer /*data
     return TRUE;
 }
 
-/* Timeout callback: stop after DEMO_DURATION_MS */
 static gboolean on_timeout(gpointer pipeline)
 {
-    g_print("poc003: 5-minute demo complete, stopping.\n");
+    g_print("poc003: demo duration reached, stopping.\n");
     gst_element_send_event(GST_ELEMENT(pipeline), gst_event_new_eos());
     return G_SOURCE_REMOVE;
 }
 
 static int real_main(int argc, char* argv[])
 {
+    /* ── Init GStreamer first with original argv (gst_macos_main requires
+     *    argv[0] to survive; do NOT pass a stack-local copy) ─────────── */
     gst_init(&argc, &argv);
+
+    /* ── Parse our own arguments after gst_init (GStreamer strips its own) */
+    const char* color_space  = "srgb";
+    bool        ycbcr        = false;
+    guint       duration_ms  = 300U * 1000U;  /* default: 5 min */
+
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--color-space") == 0 && i + 1 < argc) {
+            color_space = argv[++i];
+        } else if (strcmp(argv[i], "--ycbcr") == 0) {
+            ycbcr = true;
+        } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
+            duration_ms = (guint)(atoi(argv[++i]) * 1000);
+        }
+    }
+
+    /* Output format on the src pad depends on ycbcr flag */
+    const char* out_fmt = ycbcr ? "AYUV" : "RGBA";
 
     g_print("poc003: FLUX fluxvideotex demo — Filament textured cube\n");
     g_print("         FLUX Protocol Spec v0.6.3 §16\n");
-    g_print("         Pattern: smpte   Duration: 5 min\n\n");
+    g_print("         color-space: %s   ycbcr-output: %s   duration: %u s\n\n",
+            color_space, ycbcr ? "true" : "false", duration_ms / 1000);
 
     /* ── Build pipeline ─────────────────────────────────────────────────── */
-    GError*  err      = nullptr;
-    gchar*   pipe_str = g_strdup_printf(
+    GError* err      = nullptr;
+    gchar*  pipe_str = g_strdup_printf(
         "videotestsrc pattern=smpte is-live=true "
         "! videoconvert "
         "! video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1 "
         "! fluxvideotex name=vt width=1280 height=720 "
         "    rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 "
-        "! video/x-raw,format=RGBA,width=1280,height=720 "
+        "    color-space=%s ycbcr-output=%s "
+        "! video/x-raw,format=%s,width=1280,height=720 "
         "! videoconvert "
-        "! osxvideosink sync=false");
+        "! glimagesink sync=false",
+        color_space,
+        ycbcr ? "true" : "false",
+        out_fmt);
+
+    g_print("poc003: pipeline: %s\n\n", pipe_str);
 
     GstElement* pipeline = gst_parse_launch(pipe_str, &err);
     g_free(pipe_str);
@@ -125,8 +157,7 @@ static int real_main(int argc, char* argv[])
         return EXIT_FAILURE;
     }
 
-    /* Schedule auto-stop after 5 minutes */
-    g_timeout_add(DEMO_DURATION_MS, on_timeout, pipeline);
+    g_timeout_add(duration_ms, on_timeout, pipeline);
 
     g_print("poc003: pipeline running — press Ctrl-C to stop early\n");
     g_main_loop_run(g_loop);

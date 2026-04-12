@@ -13,6 +13,19 @@
  *   - gltfio UbershaderProvider: pre-built PBR materials, no matc step
  *   - Per-frame: upload GStreamer RGBA → filament::Texture → setParameter on
  *     every material instance in the asset → render → readPixels → vflip
+ *
+ * Thread model:
+ *   Filament requires that Engine::create() and Engine::destroy() are called
+ *   from the SAME thread.  GObject finalization (where filament_scene_destroy
+ *   is called) runs on the GLib main thread, which differs from the GStreamer
+ *   streaming thread that lazily calls filament_scene_create → Engine::create.
+ *
+ *   To satisfy this constraint we run ALL Filament operations on a single
+ *   dedicated owner thread (FilamentScene::owner_thread).  The public C API
+ *   functions post work items to that thread via a mutex+condvar and block
+ *   until the work completes.  This guarantees Engine::create and
+ *   Engine::destroy always execute on the same thread regardless of which
+ *   thread the GStreamer element calls us from.
  */
 
 #include "filament_scene.h"
@@ -53,9 +66,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <functional>
+#include <mutex>
 #include <thread>
 
 using namespace filament;
@@ -64,6 +80,13 @@ using filament::math::mat4f;
 using filament::math::float3;
 using utils::Entity;
 using utils::EntityManager;
+
+/* ─── Work-item queue (single producer, single consumer) ────────────────── */
+
+struct WorkItem {
+    std::function<void()> fn;
+    bool                  done = false;
+};
 
 /* ─── FilamentScene struct ───────────────────────────────────────────────── */
 struct FilamentScene {
@@ -74,51 +97,91 @@ struct FilamentScene {
     int  color_space_mode;   /* FILAMENT_CS_* constant */
     bool ycbcr_output;
 
-    Engine*           engine;
-    SwapChain*        swapChain;
-    Renderer*         renderer;
-    Scene*            scene;
-    View*             view;
-    Camera*           camera;
-    Entity            cameraEntity;
-    Skybox*           skybox;
-    ColorGrading*     colorGrading;  /* NULL if post-processing disabled */
+    /* Owner thread — ALL Filament calls happen here */
+    std::thread             owner_thread;
+    std::mutex              mtx;
+    std::condition_variable cv;
+    WorkItem*               pending = nullptr;   /* item posted by caller */
+    bool                    quit    = false;      /* signals thread to exit */
+
+    /* Filament objects — only touched from owner_thread */
+    Engine*           engine       = nullptr;
+    SwapChain*        swapChain    = nullptr;
+    Renderer*         renderer     = nullptr;
+    Scene*            scene        = nullptr;
+    View*             view         = nullptr;
+    Camera*           camera       = nullptr;
+    Entity            cameraEntity = {};
+    Skybox*           skybox       = nullptr;
+    ColorGrading*     colorGrading = nullptr;
 
     /* gltfio */
-    MaterialProvider* materials;
-    AssetLoader*      assetLoader;
-    ResourceLoader*   resourceLoader;
-    FilamentAsset*    asset;
+    MaterialProvider* materials      = nullptr;
+    AssetLoader*      assetLoader    = nullptr;
+    ResourceLoader*   resourceLoader = nullptr;
+    FilamentAsset*    asset          = nullptr;
 
     /* Per-frame video texture — rebuilt each frame */
-    Texture*          videoTexture;
+    Texture*  videoTexture = nullptr;
 
     /* Scratch readback buffer */
-    uint8_t*          readbackBuf;
+    uint8_t*  readbackBuf  = nullptr;
 };
 
-/* ─── Public C API ───────────────────────────────────────────────────────── */
+/* ─── Owner-thread loop ──────────────────────────────────────────────────── */
 
-FilamentScene* filament_scene_create(int width, int height,
-                                     const uint8_t* glb_data,
-                                     size_t         glb_size,
-                                     int            color_space_mode,
-                                     int            ycbcr_output)
+static void owner_thread_loop(FilamentScene* s)
 {
-    FilamentScene* s = (FilamentScene*)calloc(1, sizeof(FilamentScene));
-    if (!s) return nullptr;
-    s->width            = width;
-    s->height           = height;
-    s->color_space_mode = color_space_mode;
-    s->ycbcr_output     = (ycbcr_output != 0);
+    for (;;) {
+        WorkItem* item = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(s->mtx);
+            s->cv.wait(lk, [s]{ return s->pending != nullptr || s->quit; });
+            if (s->quit && s->pending == nullptr)
+                break;
+            item = s->pending;
+            s->pending = nullptr;
+        }
+        if (item) {
+            item->fn();
+            {
+                std::unique_lock<std::mutex> lk(s->mtx);
+                item->done = true;
+            }
+            s->cv.notify_all();
+        }
+    }
+}
 
+/* Post a work item to the owner thread and block until it finishes. */
+static void run_on_owner(FilamentScene* s, std::function<void()> fn)
+{
+    WorkItem item;
+    item.fn   = std::move(fn);
+    item.done = false;
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        s->pending = &item;
+    }
+    s->cv.notify_one();
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        s->cv.wait(lk, [&item]{ return item.done; });
+    }
+}
+
+/* ─── Internal Filament init (runs on owner thread) ─────────────────────── */
+
+static bool filament_init(FilamentScene* s,
+                          const uint8_t* glb_data, size_t glb_size)
+{
     /* Engine — headless OpenGL */
     s->engine = Engine::create(Engine::Backend::OPENGL);
-    if (!s->engine) { free(s); return nullptr; }
+    if (!s->engine) return false;
 
     /* Offscreen SwapChain */
     s->swapChain = s->engine->createSwapChain(
-        (uint32_t)width, (uint32_t)height,
+        (uint32_t)s->width, (uint32_t)s->height,
         SwapChain::CONFIG_READABLE);
 
     s->renderer = s->engine->createRenderer();
@@ -128,8 +191,11 @@ FilamentScene* filament_scene_create(int width, int height,
     /* Camera */
     s->cameraEntity = EntityManager::get().create();
     s->camera       = s->engine->createCamera(s->cameraEntity);
-    s->camera->setProjection(45.0, (double)width / (double)height, 0.1, 100.0);
-    s->camera->lookAt({0.0f, 0.0f, 4.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f});
+    s->camera->setProjection(45.0,
+        (double)s->width / (double)s->height, 0.1, 100.0);
+    s->camera->lookAt({0.0f, 0.0f, 4.0f},
+                      {0.0f, 0.0f, 0.0f},
+                      {0.0f, 1.0f, 0.0f});
 
     /* Skybox — dark background */
     s->skybox = Skybox::Builder()
@@ -139,23 +205,20 @@ FilamentScene* filament_scene_create(int width, int height,
 
     s->view->setScene(s->scene);
     s->view->setCamera(s->camera);
-    s->view->setViewport({0, 0, (uint32_t)width, (uint32_t)height});
+    s->view->setViewport({0, 0, (uint32_t)s->width, (uint32_t)s->height});
 
-    /* ── ColorGrading post-processing ─────────────────────────────────── */
-    /* Build a ColorGrading LUT for the requested output color space.
-     * Post-processing must be enabled for ColorGrading to take effect. */
+    /* ── ColorGrading post-processing ───────────────────────────────────── */
     {
         using namespace filament::color;
 
-        /* Map mode constant → color::ColorSpace DSL expression */
-        color::ColorSpace cs = Rec709 - sRGB - D65;  /* default: sRGB */
-        switch (color_space_mode) {
+        color::ColorSpace cs = Rec709 - sRGB - D65;  /* default */
+        switch (s->color_space_mode) {
         case FILAMENT_CS_BT709:          cs = Rec709  - BT709  - D65; break;
         case FILAMENT_CS_REC709_LINEAR:  cs = Rec709  - Linear - D65; break;
         case FILAMENT_CS_REC2020_LINEAR: cs = Rec2020 - Linear - D65; break;
         case FILAMENT_CS_REC2020_PQ:     cs = Rec2020 - PQ     - D65; break;
         case FILAMENT_CS_REC2020_HLG:    cs = Rec2020 - HLG    - D65; break;
-        default: break; /* FILAMENT_CS_SRGB — already set above */
+        default: break;
         }
 
         s->colorGrading = ColorGrading::Builder()
@@ -167,10 +230,7 @@ FilamentScene* filament_scene_create(int width, int height,
         s->view->setPostProcessingEnabled(true);
     }
 
-    /* ── gltfio setup ──────────────────────────────────────────────────── */
-
-    /* UbershaderProvider uses the pre-built material archive bundled in the
-     * Filament distribution — no matc compilation step required. */
+    /* ── gltfio setup ───────────────────────────────────────────────────── */
     s->materials = createUbershaderProvider(
         s->engine,
         UBERARCHIVE_DEFAULT_DATA,
@@ -181,24 +241,17 @@ FilamentScene* filament_scene_create(int width, int height,
 
     s->assetLoader = AssetLoader::create({s->engine, s->materials, ncm});
 
-    /* Parse the GLB — creates Filament entities but does NOT upload GPU data */
     s->asset = s->assetLoader->createAsset(glb_data, (uint32_t)glb_size);
     if (!s->asset) {
         fprintf(stderr, "fluxvideotex: gltfio failed to parse GLB\n");
-        /* cleanup minimal */
         AssetLoader::destroy(&s->assetLoader);
         s->materials->destroyMaterials();
         delete s->materials;
         delete ncm;
         Engine::destroy(&s->engine);
-        free(s);
-        return nullptr;
+        return false;
     }
 
-    /* ResourceLoader uploads vertex/index buffers and handles embedded images.
-     * Our cube.glb has a flux:// URI image — ResourceLoader won't find data
-     * for it (no addResourceData call for that URI), so it will leave that
-     * texture slot empty.  We fill it manually each frame. */
     ResourceConfiguration rcfg{};
     rcfg.engine = s->engine;
     rcfg.gltfPath = nullptr;
@@ -206,13 +259,11 @@ FilamentScene* filament_scene_create(int width, int height,
     s->resourceLoader = new ResourceLoader(rcfg);
     s->resourceLoader->loadResources(s->asset);
 
-    /* Add all renderable entities to the scene */
     s->asset->releaseSourceData();
     size_t count = s->asset->getRenderableEntityCount();
     const Entity* entities = s->asset->getRenderableEntities();
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i)
         s->scene->addEntity(entities[i]);
-    }
 
     /* Placeholder 1×1 grey video texture */
     s->videoTexture = Texture::Builder()
@@ -226,7 +277,6 @@ FilamentScene* filament_scene_create(int width, int height,
         Texture::Format::RGBA, Texture::Type::UBYTE, nullptr);
     s->videoTexture->setImage(*s->engine, 0, std::move(pbd));
 
-    /* Bind placeholder to all material instances now */
     TextureSampler sampler(
         TextureSampler::MinFilter::LINEAR,
         TextureSampler::MagFilter::LINEAR);
@@ -234,29 +284,27 @@ FilamentScene* filament_scene_create(int width, int height,
     if (inst) {
         size_t mcount = inst->getMaterialInstanceCount();
         MaterialInstance* const* mis = inst->getMaterialInstances();
-        for (size_t i = 0; i < mcount; ++i) {
+        for (size_t i = 0; i < mcount; ++i)
             mis[i]->setParameter("baseColorMap", s->videoTexture, sampler);
-        }
     }
 
-    s->readbackBuf = (uint8_t*)malloc((size_t)width * height * 4);
-    return s;
+    s->readbackBuf = (uint8_t*)malloc((size_t)s->width * s->height * 4);
+    return true;
 }
 
-void filament_scene_destroy(FilamentScene* s)
-{
-    if (!s) return;
+/* ─── Internal Filament teardown (runs on owner thread) ──────────────────── */
 
-    /* Remove renderable entities from scene first */
+static void filament_teardown(FilamentScene* s)
+{
+    if (!s->engine) return;
+
     size_t count = s->asset->getRenderableEntityCount();
     const Entity* entities = s->asset->getRenderableEntities();
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < count; ++i)
         s->scene->remove(entities[i]);
-    }
 
     s->assetLoader->destroyAsset(s->asset);
     delete s->resourceLoader;
-
     AssetLoader::destroy(&s->assetLoader);
     s->materials->destroyMaterials();
     delete s->materials;
@@ -275,16 +323,19 @@ void filament_scene_destroy(FilamentScene* s)
     Engine::destroy(&s->engine);
 
     free(s->readbackBuf);
-    free(s);
+    s->readbackBuf = nullptr;
 }
 
-void filament_scene_render(FilamentScene* s,
-                           const uint8_t* in_rgba, int in_w, int in_h,
-                           double elapsed_s,
-                           double period_x, double period_y, double period_z,
-                           uint8_t* out_rgba)
+/* ─── Internal render (runs on owner thread) ─────────────────────────────── */
+
+static void filament_render_frame(FilamentScene* s,
+                                  const uint8_t* in_rgba, int in_w, int in_h,
+                                  double elapsed_s,
+                                  double period_x, double period_y,
+                                  double period_z,
+                                  uint8_t* out_rgba)
 {
-    /* ── Upload video frame as new Filament texture ─────────────────────── */
+    /* Upload video frame as new Filament texture */
     s->engine->destroy(s->videoTexture);
 
     size_t nbytes = (size_t)in_w * in_h * 4;
@@ -304,9 +355,6 @@ void filament_scene_render(FilamentScene* s,
         nullptr);
     s->videoTexture->setImage(*s->engine, 0, std::move(pbd));
 
-    /* Bind to all material instances — this is the core flux:// resolution
-     * step: replace the GLB image that had uri "flux://channel/0" with the
-     * live decoded video frame, matching §10.10.5 precedence rules. */
     TextureSampler sampler(
         TextureSampler::MinFilter::LINEAR,
         TextureSampler::MagFilter::LINEAR);
@@ -314,12 +362,11 @@ void filament_scene_render(FilamentScene* s,
     if (inst) {
         size_t mcount = inst->getMaterialInstanceCount();
         MaterialInstance* const* mis = inst->getMaterialInstances();
-        for (size_t i = 0; i < mcount; ++i) {
+        for (size_t i = 0; i < mcount; ++i)
             mis[i]->setParameter("baseColorMap", s->videoTexture, sampler);
-        }
     }
 
-    /* ── Animate cube rotation ──────────────────────────────────────────── */
+    /* Animate cube rotation */
     float ax = (float)(2.0 * M_PI * elapsed_s / period_x);
     float ay = (float)(2.0 * M_PI * elapsed_s / period_y);
     float az = (float)(2.0 * M_PI * elapsed_s / period_z);
@@ -329,16 +376,10 @@ void filament_scene_render(FilamentScene* s,
               * mat4f::rotation(az, float3{0, 0, 1});
 
     auto& tcm = s->engine->getTransformManager();
-    /* Apply rotation to the root entity of the GLB asset */
     Entity root = s->asset->getRoot();
     tcm.setTransform(tcm.getInstance(root), rot);
 
-    /* ── Render + readback inside a single frame ───────────────────────── */
-    /* readPixels() must be called within a frame (after render, before endFrame).
-     * readPixels is ASYNCHRONOUS — the callback fires on the main thread once
-     * the GPU DMA into readbackBuf is complete (typically several frames later).
-     * We must pump engine->execute() until the callback fires before we can
-     * memcpy the data out. */
+    /* Render + readback */
     std::atomic<bool> readback_done{false};
 
     if (s->renderer->beginFrame(s->swapChain)) {
@@ -350,27 +391,21 @@ void filament_scene_render(FilamentScene* s,
             backend::PixelDataFormat::RGBA,
             backend::PixelDataType::UBYTE,
             [](void* /*buf*/, size_t /*sz*/, void* user) {
-                static_cast<std::atomic<bool>*>(user)->store(true,
-                    std::memory_order_release);
+                static_cast<std::atomic<bool>*>(user)->store(
+                    true, std::memory_order_release);
             },
             &readback_done);
 
-        s->renderer->readPixels(0, 0, (uint32_t)s->width, (uint32_t)s->height,
-                                std::move(readPbd));
+        s->renderer->readPixels(0, 0,
+            (uint32_t)s->width, (uint32_t)s->height,
+            std::move(readPbd));
 
         s->renderer->endFrame();
     } else {
-        /* Frame was skipped for pacing — no new readback this call.
-         * Output whatever is already in readbackBuf (previous frame or grey). */
         memcpy(out_rgba, s->readbackBuf, (size_t)s->width * s->height * 4);
         return;
     }
 
-    /* Flush commands to the backend, then spin-pump the main-thread callback
-     * queue until the GPU readback DMA signals completion.
-     * NOTE: engine->execute() is a no-op on macOS (OpenGL backend runs its own
-     * thread).  pumpMessageQueues() drains the user-callback queue on the
-     * calling thread — this is what makes the readPixels callback fire. */
     s->engine->flushAndWait();
     while (!readback_done.load(std::memory_order_acquire)) {
         s->engine->pumpMessageQueues();
@@ -390,4 +425,72 @@ void filament_scene_render(FilamentScene* s,
     }
 
     memcpy(out_rgba, s->readbackBuf, (size_t)s->width * s->height * 4);
+}
+
+/* ─── Public C API ───────────────────────────────────────────────────────── */
+
+FilamentScene* filament_scene_create(int width, int height,
+                                     const uint8_t* glb_data,
+                                     size_t         glb_size,
+                                     int            color_space_mode,
+                                     int            ycbcr_output)
+{
+    FilamentScene* s = new FilamentScene();
+    s->width            = width;
+    s->height           = height;
+    s->color_space_mode = color_space_mode;
+    s->ycbcr_output     = (ycbcr_output != 0);
+
+    /* Start the owner thread */
+    s->owner_thread = std::thread(owner_thread_loop, s);
+
+    /* Run Filament init on the owner thread */
+    bool ok = false;
+    run_on_owner(s, [s, glb_data, glb_size, &ok]{
+        ok = filament_init(s, glb_data, glb_size);
+    });
+
+    if (!ok) {
+        /* Signal quit and join */
+        {
+            std::unique_lock<std::mutex> lk(s->mtx);
+            s->quit = true;
+        }
+        s->cv.notify_one();
+        s->owner_thread.join();
+        delete s;
+        return nullptr;
+    }
+
+    return s;
+}
+
+void filament_scene_destroy(FilamentScene* s)
+{
+    if (!s) return;
+
+    /* Run teardown on the owner thread, then stop it */
+    run_on_owner(s, [s]{ filament_teardown(s); });
+
+    {
+        std::unique_lock<std::mutex> lk(s->mtx);
+        s->quit = true;
+    }
+    s->cv.notify_one();
+    s->owner_thread.join();
+
+    delete s;
+}
+
+void filament_scene_render(FilamentScene* s,
+                           const uint8_t* in_rgba, int in_w, int in_h,
+                           double elapsed_s,
+                           double period_x, double period_y, double period_z,
+                           uint8_t* out_rgba)
+{
+    run_on_owner(s, [=]{
+        filament_render_frame(s, in_rgba, in_w, in_h,
+                              elapsed_s, period_x, period_y, period_z,
+                              out_rgba);
+    });
 }
