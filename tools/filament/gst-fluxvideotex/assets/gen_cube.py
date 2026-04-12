@@ -109,12 +109,19 @@ gltf = {
             "material":  0
         }]
     }],
+    # KHR_materials_unlit: baseColor is output directly, no lighting math.
+    # This ensures the video texture is visible without any light source.
+    "extensionsUsed": ["KHR_materials_unlit"],
+    "extensionsRequired": ["KHR_materials_unlit"],
     "materials": [{
         "name": "VideoMaterial",
         "pbrMetallicRoughness": {
             "baseColorTexture": {"index": 0},
             "metallicFactor":  0.0,
             "roughnessFactor": 1.0
+        },
+        "extensions": {
+            "KHR_materials_unlit": {}
         },
         "doubleSided": True
     }],

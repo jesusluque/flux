@@ -48,10 +48,13 @@
 #include <math/mat4.h>
 #include <math/vec3.h>
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <thread>
 
 using namespace filament;
 using namespace filament::gltfio;
@@ -293,7 +296,13 @@ void filament_scene_render(FilamentScene* s,
     tcm.setTransform(tcm.getInstance(root), rot);
 
     /* ── Render + readback inside a single frame ───────────────────────── */
-    /* readPixels() must be called within a frame (after render, before endFrame). */
+    /* readPixels() must be called within a frame (after render, before endFrame).
+     * readPixels is ASYNCHRONOUS — the callback fires on the main thread once
+     * the GPU DMA into readbackBuf is complete (typically several frames later).
+     * We must pump engine->execute() until the callback fires before we can
+     * memcpy the data out. */
+    std::atomic<bool> readback_done{false};
+
     if (s->renderer->beginFrame(s->swapChain)) {
         s->renderer->render(s->view);
 
@@ -301,14 +310,34 @@ void filament_scene_render(FilamentScene* s,
             s->readbackBuf,
             (size_t)s->width * s->height * 4,
             backend::PixelDataFormat::RGBA,
-            backend::PixelDataType::UBYTE);
+            backend::PixelDataType::UBYTE,
+            [](void* /*buf*/, size_t /*sz*/, void* user) {
+                static_cast<std::atomic<bool>*>(user)->store(true,
+                    std::memory_order_release);
+            },
+            &readback_done);
 
         s->renderer->readPixels(0, 0, (uint32_t)s->width, (uint32_t)s->height,
                                 std::move(readPbd));
 
         s->renderer->endFrame();
+    } else {
+        /* Frame was skipped for pacing — no new readback this call.
+         * Output whatever is already in readbackBuf (previous frame or grey). */
+        memcpy(out_rgba, s->readbackBuf, (size_t)s->width * s->height * 4);
+        return;
     }
+
+    /* Flush commands to the backend, then spin-pump the main-thread callback
+     * queue until the GPU readback DMA signals completion.
+     * NOTE: engine->execute() is a no-op on macOS (OpenGL backend runs its own
+     * thread).  pumpMessageQueues() drains the user-callback queue on the
+     * calling thread — this is what makes the readPixels callback fire. */
     s->engine->flushAndWait();
+    while (!readback_done.load(std::memory_order_acquire)) {
+        s->engine->pumpMessageQueues();
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
 
     /* Filament readPixels is bottom-up; flip to top-down for GStreamer */
     int stride = s->width * 4;
