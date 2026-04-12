@@ -564,7 +564,7 @@
         </p>
         <ul>
           <li>gltfio UbershaderProvider — pre-built PBR shaders, no <code>matc</code> step</li>
-          <li>Multi-axis rotation animated from buffer PTS</li>
+          <li>Multi-axis rotation animated from buffer PTS via <code>rotation-period-*</code> props (software only — GLB animation tracks not played)</li>
           <li>Async <code>readPixels</code> with <code>pumpMessageQueues()</code> spin (macOS)</li>
           <li>Vertical flip on readback (Filament is bottom-up; GStreamer top-down)</li>
           <li>Thread-safe owner-thread model — all Filament calls on one dedicated thread</li>
@@ -605,13 +605,18 @@
       The default scene is a unit cube with <code>KHR_materials_unlit</code> and
       <code>baseColorTexture.uri = "flux://channel/0"</code>, generated at build time
       by <code>gen_cube.py</code> and embedded as a C byte array via <code>xxd&nbsp;-i</code>.
-      Set <code>glb-file</code> to any GLB path to use a different model — any material
+      Set <code>glb-file</code> to any GLB path to use a different mesh — any material
       whose <code>baseColorTexture</code> URI is <code>flux://channel/0</code> receives
       the live video feed; other materials are untouched.
     </p>
+    <p>
+      <strong>GLB animation tracks are not played.</strong> The <code>gltfio</code> animator
+      is not invoked — all motion comes from the software rotation driven by
+      <code>rotation-period-*</code>. The GLB provides mesh geometry and materials only.
+    </p>
 
     <h3>Run with <code>gst-launch-1.0</code></h3>
-    <div class="cmd-block"><pre><span class="cm">// SDR — default</span>
+    <div class="cmd-block"><pre><span class="cm">// Built-in cube, SDR, default rotation</span>
 GST_PLUGIN_PATH=/path/to/flux/tools/gstreamer/target/release:\
                /path/to/flux/tools/filament/build/gst-fluxvideotex \
 gst-launch-1.0 \
@@ -619,15 +624,16 @@ gst-launch-1.0 \
   ! videoconvert \
   ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
   ! fluxvideotex width=1280 height=720 \
-      rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 \
       color-space=srgb ycbcr-output=false \
   ! "video/x-raw,format=RGBA,width=1280,height=720" \
   ! videoconvert \
   ! glimagesink sync=false
 
-<span class="cm">// HLG — Y'CbCr output, custom GLB</span>
-  ! fluxvideotex color-space=rec2020-hlg ycbcr-output=true \
+<span class="cm">// Custom GLB mesh, fast rotation, HLG Y'CbCr</span>
+  ! fluxvideotex width=1280 height=720 \
       glb-file=/path/to/scene.glb \
+      rotation-period-x=10 rotation-period-y=15 rotation-period-z=20 \
+      color-space=rec2020-hlg ycbcr-output=true \
   ! "video/x-raw,format=AYUV,width=1280,height=720" \
   ! videoconvert ! ...</pre></div>
 
