@@ -8,11 +8,12 @@
  *   - osxvideosink displays the rendered output
  *
  * Usage:
- *   poc003 [--color-space <mode>] [--ycbcr]
+ *   poc003 [--color-space <mode>] [--ycbcr] [--glb <path>]
  *
  *   --color-space  One of: srgb (default), bt709, rec709-linear,
  *                          rec2020-linear, rec2020-pq, rec2020-hlg
  *   --ycbcr        Enable Y'CbCr output encoding (ycbcr-output=true)
+ *   --glb <path>   Path to a GLB file to use instead of the built-in cube
  *   --duration N   Run for N seconds (default 10)
  *
  * Without arguments runs in the original 5-minute mode.
@@ -92,6 +93,7 @@ static int real_main(int argc, char* argv[])
     /* ── Parse our own arguments after gst_init (GStreamer strips its own) */
     const char* color_space  = "srgb";
     bool        ycbcr        = false;
+    const char* glb_file     = nullptr;
     guint       duration_ms  = 300U * 1000U;  /* default: 5 min */
 
     for (int i = 1; i < argc; ++i) {
@@ -99,6 +101,8 @@ static int real_main(int argc, char* argv[])
             color_space = argv[++i];
         } else if (strcmp(argv[i], "--ycbcr") == 0) {
             ycbcr = true;
+        } else if (strcmp(argv[i], "--glb") == 0 && i + 1 < argc) {
+            glb_file = argv[++i];
         } else if (strcmp(argv[i], "--duration") == 0 && i + 1 < argc) {
             duration_ms = (guint)(atoi(argv[++i]) * 1000);
         }
@@ -109,24 +113,31 @@ static int real_main(int argc, char* argv[])
 
     g_print("poc003: FLUX fluxvideotex demo — Filament textured cube\n");
     g_print("         FLUX Protocol Spec v0.6.3 §16\n");
-    g_print("         color-space: %s   ycbcr-output: %s   duration: %u s\n\n",
+    g_print("         color-space: %s   ycbcr-output: %s   duration: %u s\n",
             color_space, ycbcr ? "true" : "false", duration_ms / 1000);
+    g_print("         glb-file: %s\n\n", glb_file ? glb_file : "(built-in cube)");
 
     /* ── Build pipeline ─────────────────────────────────────────────────── */
     GError* err      = nullptr;
+    gchar*  glb_prop = glb_file
+        ? g_strdup_printf("glb-file=\"%s\"", glb_file)
+        : g_strdup("");
+
     gchar*  pipe_str = g_strdup_printf(
         "videotestsrc pattern=smpte is-live=true "
         "! videoconvert "
         "! video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1 "
         "! fluxvideotex name=vt width=1280 height=720 "
         "    rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 "
-        "    color-space=%s ycbcr-output=%s "
+        "    color-space=%s ycbcr-output=%s %s "
         "! video/x-raw,format=%s,width=1280,height=720 "
         "! videoconvert "
         "! glimagesink sync=false",
         color_space,
         ycbcr ? "true" : "false",
+        glb_prop,
         out_fmt);
+    g_free(glb_prop);
 
     g_print("poc003: pipeline: %s\n\n", pipe_str);
 

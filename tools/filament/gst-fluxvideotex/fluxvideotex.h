@@ -68,6 +68,7 @@ struct _FluxVideotex {
     gdouble            period_z;        /* Z-rotation period in seconds (300)   */
     FluxColorSpaceMode color_space;     /* output color space (default sRGB)    */
     gboolean           ycbcr_output;    /* encode output as Y'CbCr (default off)*/
+    gchar*             glb_file;        /* path to GLB asset (NULL = embedded cube) */
 
     /* ── Runtime state ──────────────────────────────────────────────── */
     FilamentScene* scene;     /* NULL until first buffer             */

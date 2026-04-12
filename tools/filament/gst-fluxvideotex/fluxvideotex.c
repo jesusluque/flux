@@ -25,6 +25,8 @@
 #include <gst/video/video.h>
 
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #ifndef PACKAGE
 #define PACKAGE "gst-fluxvideotex"
@@ -43,6 +45,7 @@ enum {
     PROP_PERIOD_Z,
     PROP_COLOR_SPACE,
     PROP_YCBCR_OUTPUT,
+    PROP_GLB_FILE,
 };
 
 /* ── GEnum type for FluxColorSpaceMode ───────────────────────────────────── */
@@ -165,6 +168,12 @@ static void flux_videotex_class_init(FluxVideotexClass* klass)
             FALSE,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(gobject_class, PROP_GLB_FILE,
+        g_param_spec_string("glb-file", "GLB File",
+            "Path to a GLB 3D asset to load. When unset the built-in cube is used.",
+            NULL,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     gst_element_class_set_static_metadata(element_class,
         "FLUX Video Texture",
         "Filter/Effect/Video",
@@ -192,6 +201,7 @@ static void flux_videotex_init(FluxVideotex* self)
     self->period_z    = 300.0;
     self->color_space  = FLUX_CS_SRGB;
     self->ycbcr_output = FALSE;
+    self->glb_file    = NULL;
     self->scene       = NULL;
     self->start_ns    = GST_CLOCK_TIME_NONE;
 }
@@ -224,6 +234,15 @@ static void flux_videotex_set_property(GObject* object, guint prop_id,
             self->start_ns = GST_CLOCK_TIME_NONE;
         }
         break;
+    case PROP_GLB_FILE:
+        g_free(self->glb_file);
+        self->glb_file = g_value_dup_string(value);
+        if (self->scene) {
+            filament_scene_destroy(self->scene);
+            self->scene    = NULL;
+            self->start_ns = GST_CLOCK_TIME_NONE;
+        }
+        break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec); break;
     }
 }
@@ -240,6 +259,7 @@ static void flux_videotex_get_property(GObject* object, guint prop_id,
     case PROP_PERIOD_Z:     g_value_set_double(value,  self->period_z);     break;
     case PROP_COLOR_SPACE:  g_value_set_enum(value,    self->color_space);  break;
     case PROP_YCBCR_OUTPUT: g_value_set_boolean(value, self->ycbcr_output); break;
+    case PROP_GLB_FILE:     g_value_set_string(value,  self->glb_file);     break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec); break;
     }
 }
@@ -252,6 +272,8 @@ static void flux_videotex_finalize(GObject* object)
         filament_scene_destroy(self->scene);
         self->scene = NULL;
     }
+    g_free(self->glb_file);
+    self->glb_file = NULL;
     G_OBJECT_CLASS(parent_class)->finalize(object);
 }
 
@@ -328,11 +350,47 @@ static GstFlowReturn flux_videotex_transform(GstBaseTransform* trans,
 
     /* ── Lazy-init Filament scene ───────────────────────────────────── */
     if (!self->scene) {
+        const uint8_t* glb_data = cube_glb;
+        size_t         glb_size = cube_glb_len;
+        uint8_t*       glb_buf  = NULL;
+
+        /* Load from file if glb-file property is set */
+        if (self->glb_file && self->glb_file[0] != '\0') {
+            FILE* f = fopen(self->glb_file, "rb");
+            if (!f) {
+                GST_ERROR_OBJECT(self, "cannot open glb-file: %s", self->glb_file);
+                return GST_FLOW_ERROR;
+            }
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            rewind(f);
+            if (sz <= 0) {
+                GST_ERROR_OBJECT(self, "glb-file is empty: %s", self->glb_file);
+                fclose(f);
+                return GST_FLOW_ERROR;
+            }
+            glb_buf = (uint8_t*)malloc((size_t)sz);
+            if (!glb_buf || fread(glb_buf, 1, (size_t)sz, f) != (size_t)sz) {
+                GST_ERROR_OBJECT(self, "failed to read glb-file: %s", self->glb_file);
+                free(glb_buf);
+                fclose(f);
+                return GST_FLOW_ERROR;
+            }
+            fclose(f);
+            glb_data = glb_buf;
+            glb_size = (size_t)sz;
+            GST_INFO_OBJECT(self, "loaded GLB from file: %s (%zu bytes)",
+                            self->glb_file, glb_size);
+        }
+
         self->scene = filament_scene_create(
             (int)self->out_width, (int)self->out_height,
-            cube_glb, cube_glb_len,
+            glb_data, glb_size,
             (int)self->color_space,
             (int)self->ycbcr_output);
+
+        free(glb_buf);   /* safe to free — Filament has parsed it by now */
+
         if (!self->scene) {
             GST_ERROR_OBJECT(self, "filament_scene_create failed");
             return GST_FLOW_ERROR;
@@ -424,5 +482,5 @@ GST_PLUGIN_DEFINE(
     "0.1.0",
     "MPL-2.0",
     "gst-fluxvideotex",
-    "https://github.com/flux-project"
+    "https://github.com/jesusluque/flux"
 )
