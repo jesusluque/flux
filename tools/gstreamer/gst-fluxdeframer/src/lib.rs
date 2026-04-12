@@ -197,7 +197,7 @@ mod imp {
                     "FLUX Deframer",
                     "Transform/Network/FLUX",
                     "Strips FLUX header, reassembles QUIC fragments, emits raw H.265",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

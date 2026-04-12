@@ -335,7 +335,7 @@ mod imp {
                     "FLUX MSS Sync Aligner",
                     "Filter/FLUX",
                     "Timestamp-aligned multi-stream synchroniser on application/x-flux buffers (spec §6.3)",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

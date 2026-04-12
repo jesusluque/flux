@@ -143,7 +143,7 @@ mod imp {
                     "FLUX Framer",
                     "Transform/Network/FLUX",
                     "Wraps H.265 buffers in a 32-byte FLUX header (MEDIA_DATA)",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

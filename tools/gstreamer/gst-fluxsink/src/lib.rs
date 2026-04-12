@@ -220,7 +220,7 @@ mod imp {
                     "FLUX Sink",
                     "Sink/Network/FLUX",
                     "Sends FLUX frames over QUIC datagrams (crypto_quic server)",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

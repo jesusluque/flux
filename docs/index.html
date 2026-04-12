@@ -1,221 +1,198 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FLUX — Real-time 3D Video Texture Protocol</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FLUX — Fabric for Low-latency Unified eXchange</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     :root {
-      --bg:       #0d0d0d;
-      --surface:  #161616;
-      --border:   #2a2a2a;
-      --text:     #e8e8e8;
-      --muted:    #888;
-      --accent:   #5b8dee;
-      --accent2:  #7ed3b2;
-      --code-bg:  #1a1a1a;
-      --radius:   8px;
-      --mono:     'SFMono-Regular', 'Consolas', 'Liberation Mono', monospace;
+      --bg: #0d0f14;
+      --surface: #161923;
+      --surface2: #1e2330;
+      --border: #2a3045;
+      --accent: #4f8ef7;
+      --accent2: #7c5ff5;
+      --text: #e2e6f0;
+      --muted: #7a839a;
+      --green: #3ecf6e;
+      --yellow: #f5c842;
+      --red: #f55c5c;
     }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
-      font-size: 16px;
-      line-height: 1.7;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 15px;
+      line-height: 1.65;
     }
 
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
 
-    /* ── Nav ── */
+    /* ─── NAV ─── */
     nav {
-      position: sticky;
-      top: 0;
-      background: var(--bg);
+      position: sticky; top: 0; z-index: 100;
+      background: rgba(13,15,20,.92);
+      backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
+      display: flex; align-items: center; gap: 0;
       padding: 0 2rem;
-      display: flex;
-      align-items: center;
-      gap: 2rem;
-      height: 52px;
-      z-index: 100;
+      height: 56px;
     }
-    nav .logo {
-      font-weight: 700;
-      font-size: 1.1rem;
-      letter-spacing: 0.05em;
-      color: var(--text);
+    .nav-logo {
+      font-weight: 700; font-size: 1.1rem; letter-spacing: .04em;
+      color: var(--text); margin-right: auto;
     }
-    nav .logo span { color: var(--accent); }
-    nav .spacer { flex: 1; }
-    nav a { color: var(--muted); font-size: 0.9rem; }
-    nav a:hover { color: var(--text); text-decoration: none; }
+    .nav-logo span { color: var(--accent); }
+    nav a {
+      font-size: .85rem; color: var(--muted);
+      padding: 0 .9rem; height: 56px; display: flex; align-items: center;
+      border-bottom: 2px solid transparent; transition: color .15s, border-color .15s;
+    }
+    nav a:hover { color: var(--text); text-decoration: none; border-bottom-color: var(--accent); }
 
-    /* ── Hero ── */
-    .hero {
-      max-width: 860px;
-      margin: 0 auto;
-      padding: 5rem 2rem 4rem;
-      text-align: center;
+    /* ─── LAYOUT ─── */
+    .container { max-width: 1100px; margin: 0 auto; padding: 0 1.5rem; }
+
+    section { padding: 5rem 0; }
+    section + section { border-top: 1px solid var(--border); }
+
+    h1 { font-size: clamp(2rem, 5vw, 3.4rem); font-weight: 800; line-height: 1.15; }
+    h2 { font-size: 1.7rem; font-weight: 700; margin-bottom: 1.2rem; }
+    h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: .5rem; }
+    p  { color: #b0bad0; margin-bottom: .9rem; }
+
+    .tag {
+      display: inline-block; font-size: .72rem; font-weight: 600;
+      letter-spacing: .08em; text-transform: uppercase;
+      padding: .2em .65em; border-radius: 4px;
+      background: var(--surface2); color: var(--accent); border: 1px solid var(--border);
     }
-    .hero .badge {
-      display: inline-block;
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      padding: 0.25rem 0.9rem;
-      font-size: 0.8rem;
-      color: var(--muted);
-      margin-bottom: 1.5rem;
-      letter-spacing: 0.04em;
+    .tag.green { color: var(--green); }
+    .tag.yellow { color: var(--yellow); }
+
+    /* ─── HERO ─── */
+    #hero { padding: 7rem 0 5rem; }
+    .hero-eyebrow { margin-bottom: 1.5rem; display: flex; gap: .6rem; flex-wrap: wrap; }
+    .hero-sub {
+      font-size: 1.15rem; color: #8a96b0; max-width: 640px; margin: 1.4rem 0 2.5rem;
     }
-    .hero h1 {
-      font-size: clamp(2rem, 5vw, 3.2rem);
-      font-weight: 800;
-      line-height: 1.15;
-      letter-spacing: -0.02em;
-      margin-bottom: 1.2rem;
-    }
-    .hero h1 span { color: var(--accent); }
-    .hero p {
-      font-size: 1.15rem;
-      color: var(--muted);
-      max-width: 600px;
-      margin: 0 auto 2.5rem;
-    }
-    .hero .actions {
-      display: flex;
-      gap: 1rem;
-      justify-content: center;
-      flex-wrap: wrap;
-    }
+    .hero-cta { display: flex; gap: 1rem; flex-wrap: wrap; }
     .btn {
-      display: inline-block;
-      padding: 0.65rem 1.5rem;
-      border-radius: var(--radius);
-      font-size: 0.95rem;
-      font-weight: 600;
-      cursor: pointer;
-      transition: opacity 0.15s;
+      display: inline-flex; align-items: center; gap: .4rem;
+      padding: .65rem 1.4rem; border-radius: 8px; font-size: .9rem; font-weight: 600;
+      transition: opacity .15s;
     }
-    .btn:hover { opacity: 0.85; text-decoration: none; }
+    .btn:hover { opacity: .85; text-decoration: none; }
     .btn-primary { background: var(--accent); color: #fff; }
     .btn-secondary {
-      background: transparent;
+      background: var(--surface2); color: var(--text);
       border: 1px solid var(--border);
-      color: var(--text);
     }
+    .hero-badges {
+      margin-top: 3.5rem;
+      display: flex; gap: 2.5rem; flex-wrap: wrap;
+    }
+    .badge-item { display: flex; flex-direction: column; }
+    .badge-val { font-size: 1.6rem; font-weight: 800; color: var(--accent); line-height: 1.1; }
+    .badge-lbl { font-size: .78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .07em; }
 
-    /* ── Main content ── */
-    main {
-      max-width: 860px;
-      margin: 0 auto;
-      padding: 0 2rem 6rem;
+    /* ─── PROFILES ─── */
+    .profile-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+    @media (max-width: 680px) { .profile-grid { grid-template-columns: 1fr; } }
+    .profile-card {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      padding: 1.8rem;
     }
+    .profile-card h3 { font-size: 1.2rem; margin-bottom: .4rem; }
+    .profile-card .tag { margin-bottom: 1rem; }
+    .profile-card ul { list-style: none; padding: 0; }
+    .profile-card li { padding: .3rem 0; color: #9aa3b8; font-size: .9rem; }
+    .profile-card li::before { content: "→ "; color: var(--accent); }
 
-    /* ── Section ── */
-    section { margin-bottom: 4rem; }
-    h2 {
-      font-size: 1.5rem;
-      font-weight: 700;
-      margin-bottom: 1rem;
-      padding-bottom: 0.5rem;
-      border-bottom: 1px solid var(--border);
-    }
-    h3 {
-      font-size: 1.05rem;
-      font-weight: 600;
-      color: var(--accent2);
-      margin: 1.5rem 0 0.5rem;
-    }
-    p { margin-bottom: 0.9rem; color: var(--muted); }
-    p strong { color: var(--text); }
-
-    /* ── Feature grid ── */
-    .features {
+    /* ─── PILLARS ─── */
+    .pillars-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 1rem;
-      margin-top: 1.5rem;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 1.2rem;
     }
-    .feature {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.25rem;
+    .pillar {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+      padding: 1.5rem;
+      transition: border-color .2s;
     }
-    .feature .icon { font-size: 1.4rem; margin-bottom: 0.5rem; }
-    .feature h4 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.3rem; color: var(--text); }
-    .feature p  { font-size: 0.88rem; margin: 0; }
+    .pillar:hover { border-color: var(--accent); }
+    .pillar-code {
+      font-family: "SF Mono", Menlo, monospace; font-size: .8rem;
+      color: var(--accent2); margin-bottom: .5rem;
+    }
+    .pillar p { font-size: .88rem; margin-bottom: 0; color: #8a96b0; }
 
-    /* ── Code blocks ── */
-    pre {
-      background: var(--code-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.2rem 1.4rem;
-      overflow-x: auto;
-      font-family: var(--mono);
-      font-size: 0.85rem;
-      line-height: 1.6;
-      margin: 1rem 0;
-    }
-    code {
-      font-family: var(--mono);
-      font-size: 0.85em;
-      background: var(--code-bg);
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 0.1em 0.4em;
-      color: var(--accent2);
-    }
-    pre code {
-      background: none;
-      border: none;
-      padding: 0;
-      font-size: inherit;
-      color: var(--text);
-    }
-
-    /* ── Properties table ── */
+    /* ─── COMPARISON TABLE ─── */
+    .table-wrap { overflow-x: auto; }
     table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.88rem;
-      margin-top: 1rem;
+      width: 100%; border-collapse: collapse; font-size: .88rem;
     }
-    th {
-      text-align: left;
-      padding: 0.6rem 1rem;
+    th, td {
+      padding: .7rem 1rem; text-align: left;
       border-bottom: 1px solid var(--border);
-      color: var(--muted);
-      font-weight: 600;
-      font-size: 0.8rem;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
     }
-    td {
-      padding: 0.6rem 1rem;
-      border-bottom: 1px solid var(--border);
-      color: var(--muted);
-      vertical-align: top;
-    }
-    td:first-child { color: var(--accent2); font-family: var(--mono); font-size: 0.82rem; }
-    td:nth-child(2) { color: var(--muted); font-size: 0.82rem; }
-    td strong { color: var(--text); }
-    tr:last-child td { border-bottom: none; }
+    th { background: var(--surface2); color: var(--muted); font-weight: 600;
+      text-transform: uppercase; font-size: .75rem; letter-spacing: .07em; }
+    tr:hover td { background: var(--surface); }
+    td.yes { color: var(--green); font-weight: 600; }
+    td.no  { color: #3a4055; }
+    td.partial { color: var(--yellow); }
+    td.flux-col { color: var(--accent); font-weight: 700; }
 
-    /* ── Footer ── */
+    /* ─── ELEMENTS ─── */
+    .elements-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: .8rem;
+    }
+    .element {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: .9rem 1.1rem;
+    }
+    .element code {
+      font-family: "SF Mono", Menlo, monospace; font-size: .82rem;
+      color: var(--accent); display: block; margin-bottom: .25rem;
+    }
+    .element span { font-size: .8rem; color: var(--muted); }
+
+    /* ─── CODECS ─── */
+    .codec-groups { display: flex; gap: 2rem; flex-wrap: wrap; }
+    .codec-group { flex: 1; min-width: 180px; }
+    .codec-group h3 { font-size: .8rem; text-transform: uppercase; letter-spacing: .08em;
+      color: var(--muted); margin-bottom: .7rem; }
+    .codec-group ul { list-style: none; padding: 0; }
+    .codec-group li {
+      font-family: "SF Mono", Menlo, monospace; font-size: .85rem;
+      color: var(--text); padding: .2rem 0; border-bottom: 1px solid var(--border);
+    }
+
+    /* ─── FLUX-E ─── */
+    .mime-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      gap: .6rem;
+    }
+    .mime {
+      font-family: "SF Mono", Menlo, monospace; font-size: .78rem;
+      background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+      padding: .45rem .8rem; color: #9aa3b8;
+    }
+
+    /* ─── FOOTER ─── */
     footer {
       border-top: 1px solid var(--border);
-      padding: 2rem;
+      padding: 2.5rem 0;
       text-align: center;
-      font-size: 0.85rem;
-      color: var(--muted);
+      font-size: .82rem; color: var(--muted);
     }
     footer a { color: var(--muted); }
     footer a:hover { color: var(--text); }
@@ -223,195 +200,376 @@
 </head>
 <body>
 
+<!-- NAV -->
 <nav>
-  <span class="logo"><span>FLUX</span> videotex</span>
-  <span class="spacer"></span>
-  <a href="#install">Install</a>
-  <a href="#usage">Usage</a>
-  <a href="#properties">Properties</a>
-  <a href="https://github.com/jesusluque/flux" target="_blank">GitHub</a>
+  <span class="nav-logo"><span>FLUX</span></span>
+  <a href="#profiles">Profiles</a>
+  <a href="#pillars">Pillars</a>
+  <a href="#comparison">Compare</a>
+  <a href="#elements">Elements</a>
+  <a href="#embed">FLUX-E</a>
+  <a href="https://github.com/jesusluque/flux">GitHub</a>
 </nav>
 
-<div class="hero">
-  <div class="badge">FLUX Protocol Spec v0.6.3 §16</div>
-  <h1>Real-time 3D video textures<br>for <span>GStreamer</span></h1>
-  <p>
-    <strong>fluxvideotex</strong> is a GStreamer element that uploads live video
-    frames as GPU textures onto any GLB 3D scene, rendered offscreen via
-    Filament with full HDR color-grading support.
-  </p>
-  <div class="actions">
-    <a class="btn btn-primary" href="https://github.com/jesusluque/flux" target="_blank">View on GitHub</a>
-    <a class="btn btn-secondary" href="#usage">Get started</a>
-  </div>
-</div>
-
-<main>
-
-  <section>
-    <h2>What it does</h2>
-    <p>
-      Each incoming <strong>RGBA video frame</strong> is uploaded as a Filament texture,
-      bound to the <code>baseColorMap</code> of every material in your GLB scene,
-      rendered offscreen via OpenGL, and emitted downstream as a new video frame —
-      all inside a standard GStreamer transform element.
+<!-- HERO -->
+<section id="hero">
+  <div class="container">
+    <div class="hero-eyebrow">
+      <span class="tag">v0.6.3 — 2026-04-05</span>
+      <span class="tag green">Public Draft</span>
+      <span class="tag yellow">BSD-3-Clause</span>
+    </div>
+    <h1>Fabric for Low-latency<br>Unified eXchange</h1>
+    <p class="hero-sub">
+      FLUX is an open, low-latency media transport protocol designed for professional
+      broadcast and real-time production. It combines adaptive unicast QUIC streams with
+      scalable UDP multicast, integrating synchronization, tally, discovery, in-stream 3D
+      embedding, and upstream control in a single coherent fabric.
     </p>
-    <div class="features">
-      <div class="feature">
-        <div class="icon">&#127916;</div>
-        <h4>Any GLB model</h4>
-        <p>Load any glTF 2.0 binary asset at runtime via the <code>glb-file</code> property. Falls back to a built-in cube.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="https://github.com/jesusluque/flux/blob/master/spec/FLUX_Protocol_Spec_v0_6_3_EN.md">Read the Spec</a>
+      <a class="btn btn-secondary" href="https://github.com/jesusluque/flux">View on GitHub</a>
+    </div>
+    <div class="hero-badges">
+      <div class="badge-item"><span class="badge-val">&lt;1 ms</span><span class="badge-lbl">glass-to-glass target</span></div>
+      <div class="badge-item"><span class="badge-val">±50 µs</span><span class="badge-lbl">SW-PTP sync accuracy</span></div>
+      <div class="badge-item"><span class="badge-val">7</span><span class="badge-lbl">protocol pillars</span></div>
+      <div class="badge-item"><span class="badge-val">16</span><span class="badge-lbl">GStreamer elements</span></div>
+      <div class="badge-item"><span class="badge-val">16</span><span class="badge-lbl">FLUX-E MIME types</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- TRANSPORT PROFILES -->
+<section id="profiles">
+  <div class="container">
+    <h2>Transport Profiles</h2>
+    <p>FLUX defines two complementary transport profiles to cover the full spectrum of production topologies.</p>
+    <div class="profile-grid">
+      <div class="profile-card">
+        <span class="tag">Unicast</span>
+        <h3>FLUX/QUIC</h3>
+        <p>QUIC Datagram (RFC 9221) over UDP. Adaptive, encrypted, connection-oriented point-to-point delivery with per-client feedback.</p>
+        <ul>
+          <li>QUIC Datagram transport (unreliable, ordered)</li>
+          <li>Client-Driven Bandwidth Control (CDBC)</li>
+          <li>XOR and RS-2D forward error correction</li>
+          <li>TLS 1.3 per-session encryption</li>
+          <li>ARQ with bounded retransmit budget</li>
+          <li>Upstream control channel (FLUX-C)</li>
+        </ul>
       </div>
-      <div class="feature">
-        <div class="icon">&#127775;</div>
-        <h4>HDR color grading</h4>
-        <p>sRGB, BT.709, Rec.709 Linear, Rec.2020 Linear, PQ (ST.2084), and HLG output color spaces.</p>
-      </div>
-      <div class="feature">
-        <div class="icon">&#127381;</div>
-        <h4>Y'CbCr output</h4>
-        <p>Optional YCbCr encoding via Filament ColorGrading. Emits <code>AYUV</code> on the src pad.</p>
-      </div>
-      <div class="feature">
-        <div class="icon">&#9881;</div>
-        <h4>GStreamer native</h4>
-        <p>Drop-in BaseTransform element. Plug anywhere in a pipeline between <code>videoconvert</code> elements.</p>
+      <div class="profile-card">
+        <span class="tag">Multicast</span>
+        <h3>FLUX/M</h3>
+        <p>UDP Source-Specific Multicast (SSM) with proactive RaptorQ FEC. Scales to unlimited receivers with no per-receiver signalling.</p>
+        <ul>
+          <li>UDP SSM — scales to unlimited receivers</li>
+          <li>RaptorQ proactive FEC (25% overhead)</li>
+          <li>AES-256-GCM group key encryption</li>
+          <li>No ARQ, no per-session handshake</li>
+          <li>AMT tunneling (RFC 7450) for unicast fallback</li>
+          <li>FLUX/QUIC gateway via <code>fluxmcastrelay</code></li>
+        </ul>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <section id="install">
-    <h2>Build &amp; install</h2>
-    <h3>Prerequisites</h3>
-    <p>macOS (Apple Silicon), GStreamer 1.22+, CMake 3.20+, a local build of <a href="https://github.com/jesusluque/filament" target="_blank">jesusluque/filament</a>.</p>
+<!-- SEVEN PILLARS -->
+<section id="pillars">
+  <div class="container">
+    <h2>Seven Pillars</h2>
+    <p>Every FLUX implementation is built on seven orthogonal subsystems, each addressable independently.</p>
+    <div class="pillars-grid">
 
-    <h3>Clone and build</h3>
-    <pre><code>git clone https://github.com/jesusluque/flux
-cd flux/tools/filament
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target gstfluxvideotex</code></pre>
+      <div class="pillar">
+        <div class="pillar-code">CDBC</div>
+        <h3>Client-Driven Bandwidth Control</h3>
+        <p>Receivers report per-frame loss and RTT; the sender adjusts bitrate and FEC ratio in real time. Adaptive quality without over-provisioning. FLUX/QUIC only.</p>
+      </div>
 
-    <h3>Register the plugin</h3>
-    <pre><code>export GST_PLUGIN_PATH=/path/to/flux/tools/filament/build/gst-fluxvideotex
+      <div class="pillar">
+        <div class="pillar-code">MSS</div>
+        <h3>Multi-Stream Synchronization</h3>
+        <p>Software PTP distributed via the FLUX stream itself. ±50–500 µs inter-stream alignment without dedicated hardware. Optional hardware PTP for sub-10 µs accuracy.</p>
+      </div>
 
-# Verify
-gst-inspect-1.0 fluxvideotex</code></pre>
-  </section>
+      <div class="pillar">
+        <div class="pillar-code">FLUX-D</div>
+        <h3>Discovery</h3>
+        <p>Two-tier service discovery: mDNS / DNS-SD for zero-config LAN operation, and an HTTP/JSON registry for enterprise-scale topologies.</p>
+      </div>
 
-  <section id="usage">
-    <h2>Usage</h2>
-    <h3>Built-in cube (quickstart)</h3>
-    <pre><code>gst-launch-1.0 \
-  videotestsrc pattern=smpte is-live=true \
-  ! videoconvert \
-  ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
-  ! fluxvideotex width=1280 height=720 \
-  ! "video/x-raw,format=RGBA,width=1280,height=720" \
-  ! videoconvert ! glimagesink</code></pre>
+      <div class="pillar">
+        <div class="pillar-code">FLUX-T</div>
+        <h3>Bidirectional Tally</h3>
+        <p>First-class tally in the protocol fabric. JSON representation for configuration; compact 3-bit binary (8 states: OFF, PGM, PVW, RECORD, STREAM, HOTSPOT, REHEARSAL, FAULT) in-stream.</p>
+      </div>
 
-    <h3>Custom GLB model</h3>
-    <pre><code>gst-launch-1.0 \
-  videotestsrc pattern=smpte is-live=true \
-  ! videoconvert \
-  ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
-  ! fluxvideotex glb-file=/path/to/model.glb width=1280 height=720 \
-  ! "video/x-raw,format=RGBA,width=1280,height=720" \
-  ! videoconvert ! glimagesink</code></pre>
+      <div class="pillar">
+        <div class="pillar-code">FLUX-M</div>
+        <h3>Automatic Monitor Stream</h3>
+        <p>Every FLUX source optionally emits a low-bitrate confidence sub-stream (the Monitor Stream) derived automatically from the primary essence, enabling passive monitoring without extra encoder instances.</p>
+      </div>
 
-    <h3>HDR output (Rec.2020 PQ)</h3>
-    <pre><code>! fluxvideotex glb-file=model.glb color-space=rec2020-pq width=1280 height=720 !</code></pre>
+      <div class="pillar">
+        <div class="pillar-code">FLUX-E</div>
+        <h3>In-stream Embedding</h3>
+        <p>Binary channels embedded inside a FLUX stream carry GLB, USD, Gaussian Splats, delta updates, EXR frames, CSV, MoCap, LED config, ANC, tracking data, and live video textures via <code>flux://</code> URIs — multiplexed alongside video and audio with frame-accurate timing.</p>
+      </div>
 
-    <h3>Y'CbCr output</h3>
-    <pre><code>! fluxvideotex glb-file=model.glb ycbcr-output=true width=1280 height=720 \
-! "video/x-raw,format=AYUV,width=1280,height=720" !</code></pre>
+      <div class="pillar">
+        <div class="pillar-code">FLUX-C</div>
+        <h3>Upstream Control Channel</h3>
+        <p>A rate-limited, authenticated reverse channel for PTZ commands, audio mix automation, routing requests, and generic device control. Operates within the same QUIC connection, no side-channel required.</p>
+      </div>
 
-    <h3>poc003 demo app</h3>
-    <pre><code># Built-in cube
-GST_PLUGIN_PATH=.../gst-fluxvideotex \
-open -a /tmp/poc003.app --args --duration 60
+    </div>
+  </div>
+</section>
 
-# Custom model with HDR
-GST_PLUGIN_PATH=.../gst-fluxvideotex \
-open -a /tmp/poc003.app --args \
-  --glb /path/to/model.glb \
-  --color-space rec2020-pq \
-  --duration 60</code></pre>
-  </section>
+<!-- COMPARISON -->
+<section id="comparison">
+  <div class="container">
+    <h2>Protocol Comparison</h2>
+    <p>How FLUX stands against common professional media transport protocols.</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Feature</th>
+            <th class="flux-col">FLUX</th>
+            <th>SRT</th>
+            <th>RIST</th>
+            <th>NDI</th>
+            <th>SMPTE 2110</th>
+            <th>OMT</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Transport</td>
+            <td class="flux-col">QUIC / UDP SSM</td>
+            <td>UDP</td>
+            <td>UDP</td>
+            <td>UDP</td>
+            <td>UDP RTP</td>
+            <td>UDP</td>
+          </tr>
+          <tr>
+            <td>Encryption</td>
+            <td class="yes">TLS 1.3 / AES-256-GCM</td>
+            <td class="yes">AES-128/256</td>
+            <td class="yes">AES-128/256</td>
+            <td class="partial">Optional</td>
+            <td class="no">No</td>
+            <td class="partial">Optional</td>
+          </tr>
+          <tr>
+            <td>Adaptive bitrate (CDBC)</td>
+            <td class="yes">Yes</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="partial">Partial</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Multicast</td>
+            <td class="yes">Yes (SSM + RaptorQ)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="yes">Yes</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Sub-ms synchronization</td>
+            <td class="yes">Yes (SW-PTP ±50 µs)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="yes">Yes (PTP HW)</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Built-in tally</td>
+            <td class="yes">Yes (FLUX-T)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="partial">Metadata only</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>In-stream 3D / binary embedding</td>
+            <td class="yes">Yes (FLUX-E)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Live video texture URIs (flux://)</td>
+            <td class="yes">Yes</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Upstream control channel</td>
+            <td class="yes">Yes (FLUX-C)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="partial">Partial</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Service discovery</td>
+            <td class="yes">Yes (DNS-SD + HTTP registry)</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+            <td class="yes">mDNS</td>
+            <td class="no">No</td>
+            <td class="no">No</td>
+          </tr>
+          <tr>
+            <td>Open spec / open source</td>
+            <td class="yes">Yes (BSD-3-Clause)</td>
+            <td class="yes">Yes</td>
+            <td class="yes">Yes</td>
+            <td class="no">No</td>
+            <td class="partial">Paid standard</td>
+            <td class="yes">Yes</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
 
-  <section id="properties">
-    <h2>Element properties</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Property</th>
-          <th>Type</th>
-          <th>Default</th>
-          <th>Description</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>glb-file</td>
-          <td>string</td>
-          <td><strong>unset</strong></td>
-          <td>Path to a GLB asset. When unset the built-in cube is used.</td>
-        </tr>
-        <tr>
-          <td>width</td>
-          <td>uint</td>
-          <td><strong>1280</strong></td>
-          <td>Rendered output width in pixels.</td>
-        </tr>
-        <tr>
-          <td>height</td>
-          <td>uint</td>
-          <td><strong>720</strong></td>
-          <td>Rendered output height in pixels.</td>
-        </tr>
-        <tr>
-          <td>color-space</td>
-          <td>enum</td>
-          <td><strong>srgb</strong></td>
-          <td><code>srgb</code> · <code>bt709</code> · <code>rec709-linear</code> · <code>rec2020-linear</code> · <code>rec2020-pq</code> · <code>rec2020-hlg</code></td>
-        </tr>
-        <tr>
-          <td>ycbcr-output</td>
-          <td>boolean</td>
-          <td><strong>false</strong></td>
-          <td>Encode output as Y'CbCr. Src pad emits <code>AYUV</code> instead of <code>RGBA</code>.</td>
-        </tr>
-        <tr>
-          <td>rotation-period-x</td>
-          <td>double</td>
-          <td><strong>150</strong></td>
-          <td>Seconds per full X-axis rotation.</td>
-        </tr>
-        <tr>
-          <td>rotation-period-y</td>
-          <td>double</td>
-          <td><strong>200</strong></td>
-          <td>Seconds per full Y-axis rotation.</td>
-        </tr>
-        <tr>
-          <td>rotation-period-z</td>
-          <td>double</td>
-          <td><strong>300</strong></td>
-          <td>Seconds per full Z-axis rotation.</td>
-        </tr>
-      </tbody>
-    </table>
-  </section>
+<!-- GSTREAMER ELEMENTS -->
+<section id="elements">
+  <div class="container">
+    <h2>GStreamer Elements</h2>
+    <p>The FLUX GStreamer plugin suite provides a complete set of pipeline elements for every role in the signal chain.</p>
+    <div class="elements-grid">
+      <div class="element"><code>fluxsrc</code><span>FLUX/QUIC source</span></div>
+      <div class="element"><code>fluxsink</code><span>FLUX/QUIC sink</span></div>
+      <div class="element"><code>fluxdemux</code><span>Stream demultiplexer</span></div>
+      <div class="element"><code>fluxsync</code><span>Multi-stream sync (MSS)</span></div>
+      <div class="element"><code>fluxembedsrc</code><span>FLUX-E embed source</span></div>
+      <div class="element"><code>fluxembeddec</code><span>FLUX-E embed decoder</span></div>
+      <div class="element"><code>fluxdeltadec</code><span>GLB / GS delta decoder</span></div>
+      <div class="element"><code>fluxvideotex</code><span>Live video texture (GLB)</span></div>
+      <div class="element"><code>fluxcdbc</code><span>Bandwidth control feedback</span></div>
+      <div class="element"><code>fluxtally</code><span>Tally state handler (FLUX-T)</span></div>
+      <div class="element"><code>fluxcrypto</code><span>Encrypt / decrypt</span></div>
+      <div class="element"><code>fluxmcastsrc</code><span>FLUX/M multicast source</span></div>
+      <div class="element"><code>fluxmcastrelay</code><span>Multicast → QUIC gateway</span></div>
+      <div class="element"><code>fluxmcastsink</code><span>FLUX/M multicast sink</span></div>
+      <div class="element"><code>fluxgsresidualdec</code><span>GS residual decoder</span></div>
+      <div class="element"><code>fluxframer</code><span>FLUX frame packetizer</span></div>
+    </div>
+  </div>
+</section>
 
-</main>
+<!-- FLUX-E EMBEDDING -->
+<section id="embed">
+  <div class="container">
+    <h2>FLUX-E — In-stream Embedding</h2>
+    <p>
+      FLUX-E multiplexes typed binary channels alongside video and audio inside a single FLUX stream.
+      Each channel is identified by a MIME type and carries a <code>flux://</code>-addressable asset,
+      enabling real-time delivery of 3D scenes, neural renders, metadata, and control data with
+      frame-accurate timing and no out-of-band signalling.
+    </p>
+    <p>Supported MIME types (v0.6.3):</p>
+    <div class="mime-grid">
+      <div class="mime">model/gltf-binary</div>
+      <div class="mime">model/vnd.usd</div>
+      <div class="mime">model/vnd.gaussian-splat</div>
+      <div class="mime">application/vnd.flux.glb-delta</div>
+      <div class="mime">application/vnd.flux.gs-delta</div>
+      <div class="mime">application/vnd.flux.gs-residual</div>
+      <div class="mime">application/vnd.flux.gs-sequence</div>
+      <div class="mime">application/json</div>
+      <div class="mime">text/csv</div>
+      <div class="mime">image/x-exr</div>
+      <div class="mime">image/png</div>
+      <div class="mime">application/vnd.flux.tracking</div>
+      <div class="mime">application/vnd.flux.anc</div>
+      <div class="mime">application/vnd.flux.mocap</div>
+      <div class="mime">application/vnd.flux.led-config</div>
+      <div class="mime">application/octet-stream</div>
+    </div>
+  </div>
+</section>
 
+<!-- CODEC SUPPORT -->
+<section id="codecs">
+  <div class="container">
+    <h2>Codec Support</h2>
+    <div class="codec-groups">
+      <div class="codec-group">
+        <h3>Video</h3>
+        <ul>
+          <li>h265 (HEVC)</li>
+          <li>av1</li>
+          <li>jpegxs</li>
+          <li>ullc (ultra-low latency)</li>
+        </ul>
+      </div>
+      <div class="codec-group">
+        <h3>Audio</h3>
+        <ul>
+          <li>pcm_f32</li>
+          <li>aes67</li>
+        </ul>
+      </div>
+      <div class="codec-group">
+        <h3>HDR</h3>
+        <ul>
+          <li>sdr</li>
+          <li>hlg</li>
+          <li>pq (HDR10)</li>
+        </ul>
+      </div>
+      <div class="codec-group">
+        <h3>Gaussian Splat</h3>
+        <ul>
+          <li>raw-attr</li>
+          <li>queen-v1 (NVIDIA QUEEN)</li>
+        </ul>
+      </div>
+      <div class="codec-group">
+        <h3>FEC</h3>
+        <ul>
+          <li>xor (FLUX/QUIC)</li>
+          <li>rs_2d (FLUX/QUIC)</li>
+          <li>RaptorQ (FLUX/M)</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOTER -->
 <footer>
-  <p>
-    <a href="https://github.com/jesusluque/flux" target="_blank">jesusluque/flux</a>
-    &nbsp;&middot;&nbsp;
-    <a href="https://github.com/jesusluque/filament" target="_blank">jesusluque/filament</a>
-    &nbsp;&middot;&nbsp;
-    <a href="https://github.com/jesusluque/flux/blob/master/LICENSE" target="_blank">BSD-3-Clause</a>
-  </p>
+  <div class="container">
+    <p>
+      FLUX v0.6.3 &mdash; Public Draft &mdash;
+      &copy; 2026 <a href="https://github.com/jesusluque">Jesus Luque</a> &mdash;
+      <a href="https://github.com/jesusluque/flux/blob/master/LICENSE">BSD-3-Clause</a> &mdash;
+      <a href="https://github.com/jesusluque/flux">GitHub</a> &mdash;
+      <a href="https://github.com/jesusluque/flux/blob/master/spec/FLUX_Protocol_Spec_v0_6_3_EN.md">Specification</a>
+    </p>
+  </div>
 </footer>
 
 </body>

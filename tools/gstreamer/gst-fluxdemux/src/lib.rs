@@ -160,7 +160,7 @@ mod imp {
                     "FLUX Demux",
                     "Demux/Network/FLUX",
                     "Routes FLUX frames to typed src pads by frame TYPE nibble",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

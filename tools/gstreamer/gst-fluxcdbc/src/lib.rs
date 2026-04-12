@@ -257,7 +257,7 @@ mod imp {
                     "FLUX CDBC",
                     "Network/FLUX",
                     "Client-Driven Bandwidth Control — measures loss/jitter, sends adaptive CDBC_FEEDBACK",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

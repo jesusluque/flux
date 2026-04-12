@@ -357,7 +357,7 @@ mod imp {
                     "FLUX Source",
                     "Source/Network/FLUX",
                     "Receives FLUX frames over QUIC datagrams (crypto_quic client)",
-                    "LUCAB Media Technology",
+                    "Jesus Luque",
                 )
             }))
         }

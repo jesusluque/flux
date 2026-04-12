@@ -2,9 +2,9 @@
 
 ## Fabric for Low-latency Unified eXchange
 
-**Status:** Draft — LUCAB Internal
+**Status:** Draft — Public Draft
 **Revision:** 2026-04-05
-**Author:** LUCAB Media Technology
+**Author:** Jesus Luque
 
 **Changelog v0.6.3:**
 
@@ -265,7 +265,7 @@ Client                                          Server
 {
   "flux_version": "0.6.2",
   "flux_profile": "flux_quic",
-  "client_id": "LUCAB-RECEIVER-01",
+  "client_id": "FLUX-RECEIVER-01",
   "crypto_mode": "crypto_quic",
   "codec_support": ["h265", "av1", "jpegxs", "ullc"],
   "max_channels": 16,
@@ -618,7 +618,7 @@ FLUX/M senders SHOULD increase the `SYNC_ANCHOR` rate to 250 ms in software PTP 
 Senders announce themselves. v0.6 adds `flux_profile` and `mcast_group` TXT fields:
 
 ```
-Name: "CAM_A (LUCAB Studio)"
+Name: "CAM_A (FLUX Studio)"
 TXT records:
   flux_version=0.6
   flux_profile=flux_quic,flux_m        (comma-separated if both supported)
@@ -640,7 +640,7 @@ TXT records:
   "sources": [
     {
       "id": "cam-a-lucab-studio",
-      "name": "CAM_A (LUCAB Studio)",
+      "name": "CAM_A (FLUX Studio)",
       "host": "192.168.1.50",
       "port": 7400,
       "flux_profiles": ["flux_quic", "flux_m"],
@@ -689,7 +689,7 @@ TXT records:
     "0": { "program": true,  "preview": false, "standby": false, "iso_rec": true,  "streaming": false },
     "1": { "program": false, "preview": true,  "standby": false, "iso_rec": false, "streaming": true  }
   },
-  "mixer_id": "LUCAB-MIXER-01",
+  "mixer_id": "FLUX-MIXER-01",
   "transition": "cut"
 }
 ```
@@ -1255,7 +1255,7 @@ Unlike FLUX/QUIC, FLUX/M FEC is always active and statically configured in the S
   "fps": 30,
   "scene": "VP_Take_003",
   "take": 3,
-  "production": "LUCAB_Production_01",
+  "production": "FLUX_Production_01",
   "embed_refs": ["queen-anchor-seq01"],
   "delta_refs": ["glb-delta-seq-42"],
   "gs_residual_refs": [
@@ -1631,7 +1631,7 @@ Receivers MUST retrieve the SD before joining the multicast group. The SD is ver
   "flux_version": "0.6.2",
   "flux_profile": "flux_m",
   "session_id": "flux-m-cam-a-studio",
-  "name": "CAM_A (LUCAB Studio) — Multicast",
+  "name": "CAM_A (FLUX Studio) — Multicast",
   "description": "Primary camera A — facility multicast feed",
   "sd_version": 4,
   "sd_refresh_interval_s": 30,
@@ -2783,4 +2783,4 @@ Note: QUEEN GPU decoding is expected to run inside the application renderer (e.g
 
 ---
 
-*FLUX v0.6.3 — LUCAB Media Technology — draft for internal review*
+*FLUX v0.6.3 — Jesus Luque — draft for internal review*
