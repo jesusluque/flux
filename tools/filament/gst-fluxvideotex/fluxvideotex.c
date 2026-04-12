@@ -480,7 +480,7 @@ GST_PLUGIN_DEFINE(
     "onto a Filament 3D scene with multi-axis rotation",
     plugin_init,
     "0.1.0",
-    "MPL-2.0",
+    "BSD-3-Clause",
     "gst-fluxvideotex",
     "https://github.com/jesusluque/flux"
 )
