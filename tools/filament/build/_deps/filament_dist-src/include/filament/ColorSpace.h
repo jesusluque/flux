@@ -241,11 +241,31 @@ constexpr Gamut Rec709 = {{ 0.640f, 0.330f },
                           { 0.300f, 0.600f },
                           { 0.150f, 0.060f }};
 
+//! Rec.2020/BT.2020 color gamut for Ultra High Definition (UHD/4K) broadcasting.
+//! Offers a much wider range of colors than Rec.709.
+constexpr Gamut Rec2020 = {{ 0.708f, 0.292f },
+                           { 0.170f, 0.797f },
+                           { 0.131f, 0.046f }};
+
 //! Linear transfer function.
 constexpr TransferFunction Linear = { 1.0, 0.0, 0.0, 0.0, 1.0 };
 
 //! sRGB transfer function.
 constexpr TransferFunction sRGB = { 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045, 2.4 };
+
+//! BT.709 transfer function. The standard OETF for High Definition (HD) television.
+//! Uses a 0.45 power function, which differs from the sRGB transfer function.
+constexpr TransferFunction BT709 = { 1.0 / 1.099, 0.099 / 1.099, 1.0 / 4.5, 0.081, 1.0 / 0.45 };
+
+//! PQ (Perceptual Quantizer / SMPTE ST 2084) transfer function.
+//! An HDR transfer function allowing very high brightness levels (up to 10,000 cd/m²).
+//! This is a sentinel value; the actual PQ curve is applied programmatically.
+constexpr TransferFunction PQ = { 2084.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2084.0 };
+
+//! HLG (Hybrid Log-Gamma / ARIB STD-B67) transfer function.
+//! An HDR standard designed for broadcasting, backward compatible with SDR displays.
+//! This is a sentinel value; the actual HLG curve is applied programmatically.
+constexpr TransferFunction HLG = { 2100.0, 0.0, 0.0, 0.0, 0.0, 0.0, 67.0 };
 
 //! Standard CIE 1931 2° illuminant D65. This illuminant has a color temperature of 6504K.
 constexpr WhitePoint D65 = { 0.31271f, 0.32902f };

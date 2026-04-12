@@ -465,14 +465,39 @@ public:
          * Sets the output color space for this ColorGrading object. After all color grading steps
          * have been applied, the final color will be converted in the desired color space.
          *
-         * NOTE: Currently the output color space must be one of Rec709-sRGB-D65 or
-         *       Rec709-Linear-D65. Only the transfer function is taken into account.
+         * Supported output color spaces include:
+         * - Rec709-sRGB-D65: Standard sRGB output (default)
+         * - Rec709-Linear-D65: Linear Rec.709 output
+         * - Rec709-BT709-D65: HD television standard (BT.709 OETF)
+         * - Rec2020-Linear-D65: Linear Rec.2020 wide gamut output
+         * - Rec2020-PQ-D65: HDR output with PQ/ST.2084 transfer function
+         * - Rec2020-HLG-D65: HDR output with HLG/ARIB STD-B67 transfer function
+         *
+         * Both the primaries (gamut) and transfer function are taken into account.
+         * When using Rec.2020 primaries, the color grading pipeline skips the
+         * Rec.2020-to-sRGB conversion and gamut mapping targets the wider Rec.2020 gamut.
          *
          * @param colorSpace The output color space.
          *
          * @return This Builder, for chaining calls
          */
         Builder& outputColorSpace(const color::ColorSpace& colorSpace) noexcept;
+
+        /**
+         * Enables or disables Y'CbCr (YUV) output encoding. When enabled, the final
+         * gamma-encoded R'G'B' values are converted to Y'CbCr before being stored in
+         * the LUT. The conversion uses BT.709 coefficients for Rec.709 output color
+         * spaces and BT.2020 coefficients for Rec.2020 output color spaces.
+         *
+         * Y' is stored in the range [0..1], and Cb/Cr are offset to [0..1] centered
+         * at 0.5. This is useful when rendering to video textures or displays that
+         * expect Y'CbCr input.
+         *
+         * @param ycbcrOutput Enables or disables Y'CbCr output encoding
+         *
+         * @return This Builder, for chaining calls
+         */
+        Builder& ycbcrOutput(bool ycbcrOutput) noexcept;
 
         /**
          * Creates the ColorGrading object and returns a pointer to it.
