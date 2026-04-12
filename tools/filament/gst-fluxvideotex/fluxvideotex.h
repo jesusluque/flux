@@ -17,6 +17,32 @@
 
 G_BEGIN_DECLS
 
+/* ── Output color-space modes ────────────────────────────────────────────── */
+/**
+ * FluxColorSpaceMode — selects the Filament ColorGrading output color space.
+ *
+ * Maps directly to the six color spaces expressible with the
+ * filament::color DSL (Gamut - TransferFunction - WhitePoint):
+ *
+ *   FLUX_CS_SRGB            Rec709  - sRGB   - D65   (default; standard sRGB)
+ *   FLUX_CS_BT709           Rec709  - BT709  - D65   (HD television OETF)
+ *   FLUX_CS_REC709_LINEAR   Rec709  - Linear - D65   (linear Rec.709)
+ *   FLUX_CS_REC2020_LINEAR  Rec2020 - Linear - D65   (linear Rec.2020)
+ *   FLUX_CS_REC2020_PQ      Rec2020 - PQ     - D65   (HDR / ST.2084)
+ *   FLUX_CS_REC2020_HLG     Rec2020 - HLG    - D65   (HDR / ARIB STD-B67)
+ */
+typedef enum {
+    FLUX_CS_SRGB           = 0,
+    FLUX_CS_BT709          = 1,
+    FLUX_CS_REC709_LINEAR  = 2,
+    FLUX_CS_REC2020_LINEAR = 3,
+    FLUX_CS_REC2020_PQ     = 4,
+    FLUX_CS_REC2020_HLG    = 5,
+} FluxColorSpaceMode;
+
+GType flux_color_space_mode_get_type(void);
+#define FLUX_TYPE_COLOR_SPACE_MODE (flux_color_space_mode_get_type())
+
 /* ── Type macros ─────────────────────────────────────────────────────────── */
 #define FLUX_TYPE_VIDEOTEX            (flux_videotex_get_type())
 #define FLUX_VIDEOTEX(obj)            (G_TYPE_CHECK_INSTANCE_CAST((obj), FLUX_TYPE_VIDEOTEX, FluxVideotex))
@@ -35,11 +61,13 @@ struct _FluxVideotex {
     GstBaseTransform parent;
 
     /* ── Properties ─────────────────────────────────────────────────── */
-    guint   out_width;       /* render output width  (default 1280) */
-    guint   out_height;      /* render output height (default 720)  */
-    gdouble period_x;        /* X-rotation period in seconds (150)  */
-    gdouble period_y;        /* Y-rotation period in seconds (200)  */
-    gdouble period_z;        /* Z-rotation period in seconds (300)  */
+    guint              out_width;       /* render output width  (default 1280)  */
+    guint              out_height;      /* render output height (default 720)   */
+    gdouble            period_x;        /* X-rotation period in seconds (150)   */
+    gdouble            period_y;        /* Y-rotation period in seconds (200)   */
+    gdouble            period_z;        /* Z-rotation period in seconds (300)   */
+    FluxColorSpaceMode color_space;     /* output color space (default sRGB)    */
+    gboolean           ycbcr_output;    /* encode output as Y'CbCr (default off)*/
 
     /* ── Runtime state ──────────────────────────────────────────────── */
     FilamentScene* scene;     /* NULL until first buffer             */

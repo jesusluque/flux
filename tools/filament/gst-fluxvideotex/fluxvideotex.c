@@ -41,7 +41,29 @@ enum {
     PROP_PERIOD_X,
     PROP_PERIOD_Y,
     PROP_PERIOD_Z,
+    PROP_COLOR_SPACE,
+    PROP_YCBCR_OUTPUT,
 };
+
+/* ── GEnum type for FluxColorSpaceMode ───────────────────────────────────── */
+GType flux_color_space_mode_get_type(void)
+{
+    static GType type = 0;
+    if (g_once_init_enter(&type)) {
+        static const GEnumValue values[] = {
+            { FLUX_CS_SRGB,           "FLUX_CS_SRGB",           "srgb"           },
+            { FLUX_CS_BT709,          "FLUX_CS_BT709",          "bt709"          },
+            { FLUX_CS_REC709_LINEAR,  "FLUX_CS_REC709_LINEAR",  "rec709-linear"  },
+            { FLUX_CS_REC2020_LINEAR, "FLUX_CS_REC2020_LINEAR", "rec2020-linear" },
+            { FLUX_CS_REC2020_PQ,     "FLUX_CS_REC2020_PQ",     "rec2020-pq"     },
+            { FLUX_CS_REC2020_HLG,    "FLUX_CS_REC2020_HLG",    "rec2020-hlg"    },
+            { 0, NULL, NULL }
+        };
+        GType t = g_enum_register_static("FluxColorSpaceMode", values);
+        g_once_init_leave(&type, t);
+    }
+    return type;
+}
 
 /* ── Pad templates ───────────────────────────────────────────────────────── */
 static GstStaticPadTemplate sink_template = GST_STATIC_PAD_TEMPLATE(
@@ -63,7 +85,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE(
     GST_PAD_ALWAYS,
     GST_STATIC_CAPS(
         "video/x-raw, "
-        "format = (string) RGBA, "
+        "format = (string) { RGBA, AYUV }, "
         "width  = " GST_VIDEO_SIZE_RANGE ", "
         "height = " GST_VIDEO_SIZE_RANGE ", "
         "framerate = " GST_VIDEO_FPS_RANGE
@@ -128,6 +150,21 @@ static void flux_videotex_class_init(FluxVideotexClass* klass)
             1.0, 3600.0, 300.0,
             G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+    g_object_class_install_property(gobject_class, PROP_COLOR_SPACE,
+        g_param_spec_enum("color-space", "Output Color Space",
+            "Output color space for Filament ColorGrading post-processing "
+            "(srgb, bt709, rec709-linear, rec2020-linear, rec2020-pq, rec2020-hlg)",
+            FLUX_TYPE_COLOR_SPACE_MODE,
+            FLUX_CS_SRGB,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+    g_object_class_install_property(gobject_class, PROP_YCBCR_OUTPUT,
+        g_param_spec_boolean("ycbcr-output", "Y'CbCr Output",
+            "Encode the color-graded output as packed Y'CbCr (R=Y', G=Cb, B=Cr, A=1). "
+            "When enabled the src pad emits AYUV instead of RGBA.",
+            FALSE,
+            G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
     gst_element_class_set_static_metadata(element_class,
         "FLUX Video Texture",
         "Filter/Effect/Video",
@@ -148,13 +185,15 @@ static void flux_videotex_class_init(FluxVideotexClass* klass)
 /* ── Instance init ───────────────────────────────────────────────────────── */
 static void flux_videotex_init(FluxVideotex* self)
 {
-    self->out_width  = 1280;
-    self->out_height = 720;
-    self->period_x   = 150.0;
-    self->period_y   = 200.0;
-    self->period_z   = 300.0;
-    self->scene      = NULL;
-    self->start_ns   = GST_CLOCK_TIME_NONE;
+    self->out_width   = 1280;
+    self->out_height  = 720;
+    self->period_x    = 150.0;
+    self->period_y    = 200.0;
+    self->period_z    = 300.0;
+    self->color_space  = FLUX_CS_SRGB;
+    self->ycbcr_output = FALSE;
+    self->scene       = NULL;
+    self->start_ns    = GST_CLOCK_TIME_NONE;
 }
 
 /* ── Property accessors ──────────────────────────────────────────────────── */
@@ -163,11 +202,28 @@ static void flux_videotex_set_property(GObject* object, guint prop_id,
 {
     FluxVideotex* self = FLUX_VIDEOTEX(object);
     switch (prop_id) {
-    case PROP_WIDTH:    self->out_width  = g_value_get_uint(value);   break;
-    case PROP_HEIGHT:   self->out_height = g_value_get_uint(value);   break;
-    case PROP_PERIOD_X: self->period_x   = g_value_get_double(value); break;
-    case PROP_PERIOD_Y: self->period_y   = g_value_get_double(value); break;
-    case PROP_PERIOD_Z: self->period_z   = g_value_get_double(value); break;
+    case PROP_WIDTH:        self->out_width    = g_value_get_uint(value);   break;
+    case PROP_HEIGHT:       self->out_height   = g_value_get_uint(value);   break;
+    case PROP_PERIOD_X:     self->period_x     = g_value_get_double(value); break;
+    case PROP_PERIOD_Y:     self->period_y     = g_value_get_double(value); break;
+    case PROP_PERIOD_Z:     self->period_z     = g_value_get_double(value); break;
+    case PROP_COLOR_SPACE:
+        self->color_space = (FluxColorSpaceMode)g_value_get_enum(value);
+        /* Re-create scene on next buffer so ColorGrading is rebuilt */
+        if (self->scene) {
+            filament_scene_destroy(self->scene);
+            self->scene    = NULL;
+            self->start_ns = GST_CLOCK_TIME_NONE;
+        }
+        break;
+    case PROP_YCBCR_OUTPUT:
+        self->ycbcr_output = g_value_get_boolean(value);
+        if (self->scene) {
+            filament_scene_destroy(self->scene);
+            self->scene    = NULL;
+            self->start_ns = GST_CLOCK_TIME_NONE;
+        }
+        break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec); break;
     }
 }
@@ -177,11 +233,13 @@ static void flux_videotex_get_property(GObject* object, guint prop_id,
 {
     FluxVideotex* self = FLUX_VIDEOTEX(object);
     switch (prop_id) {
-    case PROP_WIDTH:    g_value_set_uint(value,   self->out_width);  break;
-    case PROP_HEIGHT:   g_value_set_uint(value,   self->out_height); break;
-    case PROP_PERIOD_X: g_value_set_double(value, self->period_x);   break;
-    case PROP_PERIOD_Y: g_value_set_double(value, self->period_y);   break;
-    case PROP_PERIOD_Z: g_value_set_double(value, self->period_z);   break;
+    case PROP_WIDTH:        g_value_set_uint(value,    self->out_width);    break;
+    case PROP_HEIGHT:       g_value_set_uint(value,    self->out_height);   break;
+    case PROP_PERIOD_X:     g_value_set_double(value,  self->period_x);     break;
+    case PROP_PERIOD_Y:     g_value_set_double(value,  self->period_y);     break;
+    case PROP_PERIOD_Z:     g_value_set_double(value,  self->period_z);     break;
+    case PROP_COLOR_SPACE:  g_value_set_enum(value,    self->color_space);  break;
+    case PROP_YCBCR_OUTPUT: g_value_set_boolean(value, self->ycbcr_output); break;
     default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec); break;
     }
 }
@@ -207,9 +265,13 @@ static GstCaps* flux_videotex_transform_caps(GstBaseTransform* trans,
     GstCaps* result;
 
     if (direction == GST_PAD_SINK) {
-        /* Sink→Src: fix output size to our render dimensions */
+        /* Sink→Src: fix output size and format to our render dimensions.
+         * When ycbcr_output is TRUE the ColorGrading LUT stores Y'CbCr in
+         * the RGBA8 buffer (R=Y', G=Cb, B=Cr, A=1), so we advertise AYUV
+         * downstream; otherwise plain RGBA. */
+        const char* fmt = self->ycbcr_output ? "AYUV" : "RGBA";
         result = gst_caps_new_simple("video/x-raw",
-            "format",    G_TYPE_STRING, "RGBA",
+            "format",    G_TYPE_STRING, fmt,
             "width",     G_TYPE_INT,    (gint)self->out_width,
             "height",    G_TYPE_INT,    (gint)self->out_height,
             "framerate", GST_TYPE_FRACTION_RANGE, 0, 1, G_MAXINT, 1,
@@ -268,7 +330,9 @@ static GstFlowReturn flux_videotex_transform(GstBaseTransform* trans,
     if (!self->scene) {
         self->scene = filament_scene_create(
             (int)self->out_width, (int)self->out_height,
-            cube_glb, cube_glb_len);
+            cube_glb, cube_glb_len,
+            (int)self->color_space,
+            (int)self->ycbcr_output);
         if (!self->scene) {
             GST_ERROR_OBJECT(self, "filament_scene_create failed");
             return GST_FLOW_ERROR;

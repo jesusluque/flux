@@ -19,6 +19,8 @@
 
 #include <filament/Engine.h>
 #include <filament/Camera.h>
+#include <filament/ColorGrading.h>
+#include <filament/ColorSpace.h>
 #include <filament/Material.h>
 #include <filament/MaterialInstance.h>
 #include <filament/RenderableManager.h>
@@ -68,6 +70,10 @@ struct FilamentScene {
     int width;
     int height;
 
+    /* Color grading configuration (set at create time) */
+    int  color_space_mode;   /* FILAMENT_CS_* constant */
+    bool ycbcr_output;
+
     Engine*           engine;
     SwapChain*        swapChain;
     Renderer*         renderer;
@@ -76,6 +82,7 @@ struct FilamentScene {
     Camera*           camera;
     Entity            cameraEntity;
     Skybox*           skybox;
+    ColorGrading*     colorGrading;  /* NULL if post-processing disabled */
 
     /* gltfio */
     MaterialProvider* materials;
@@ -94,12 +101,16 @@ struct FilamentScene {
 
 FilamentScene* filament_scene_create(int width, int height,
                                      const uint8_t* glb_data,
-                                     size_t         glb_size)
+                                     size_t         glb_size,
+                                     int            color_space_mode,
+                                     int            ycbcr_output)
 {
     FilamentScene* s = (FilamentScene*)calloc(1, sizeof(FilamentScene));
     if (!s) return nullptr;
-    s->width  = width;
-    s->height = height;
+    s->width            = width;
+    s->height           = height;
+    s->color_space_mode = color_space_mode;
+    s->ycbcr_output     = (ycbcr_output != 0);
 
     /* Engine — headless OpenGL */
     s->engine = Engine::create(Engine::Backend::OPENGL);
@@ -129,7 +140,32 @@ FilamentScene* filament_scene_create(int width, int height,
     s->view->setScene(s->scene);
     s->view->setCamera(s->camera);
     s->view->setViewport({0, 0, (uint32_t)width, (uint32_t)height});
-    s->view->setPostProcessingEnabled(false);
+
+    /* ── ColorGrading post-processing ─────────────────────────────────── */
+    /* Build a ColorGrading LUT for the requested output color space.
+     * Post-processing must be enabled for ColorGrading to take effect. */
+    {
+        using namespace filament::color;
+
+        /* Map mode constant → color::ColorSpace DSL expression */
+        color::ColorSpace cs = Rec709 - sRGB - D65;  /* default: sRGB */
+        switch (color_space_mode) {
+        case FILAMENT_CS_BT709:          cs = Rec709  - BT709  - D65; break;
+        case FILAMENT_CS_REC709_LINEAR:  cs = Rec709  - Linear - D65; break;
+        case FILAMENT_CS_REC2020_LINEAR: cs = Rec2020 - Linear - D65; break;
+        case FILAMENT_CS_REC2020_PQ:     cs = Rec2020 - PQ     - D65; break;
+        case FILAMENT_CS_REC2020_HLG:    cs = Rec2020 - HLG    - D65; break;
+        default: break; /* FILAMENT_CS_SRGB — already set above */
+        }
+
+        s->colorGrading = ColorGrading::Builder()
+            .outputColorSpace(cs)
+            .ycbcrOutput(s->ycbcr_output)
+            .build(*s->engine);
+
+        s->view->setColorGrading(s->colorGrading);
+        s->view->setPostProcessingEnabled(true);
+    }
 
     /* ── gltfio setup ──────────────────────────────────────────────────── */
 
@@ -227,6 +263,8 @@ void filament_scene_destroy(FilamentScene* s)
 
     s->engine->destroy(s->videoTexture);
     s->engine->destroy(s->skybox);
+    if (s->colorGrading)
+        s->engine->destroy(s->colorGrading);
     s->engine->destroyCameraComponent(s->cameraEntity);
     EntityManager::get().destroy(s->cameraEntity);
 
