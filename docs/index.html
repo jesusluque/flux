@@ -562,6 +562,14 @@
           The OpenGL context is headless (<code>Engine::Backend::OPENGL</code>) with an offscreen
           <code>SwapChain</code> configured <code>CONFIG_READABLE</code> for DMA readback.
         </p>
+        <p>
+          FLUX uses a fork of Filament —
+          <a href="https://github.com/jesusluque/filament" target="_blank">jesusluque/filament</a>
+          (<a href="https://github.com/jesusluque/filament/pull/1" target="_blank">PR&nbsp;#1</a>,
+          commit <a href="https://github.com/jesusluque/filament/commit/a7b0837ba732260525944b8a60cc185d3c7c42ae" target="_blank"><code>a7b0837</code></a>)
+          — which adds Rec.709/Rec.2020/PQ/HLG color spaces and Y'CbCr output to
+          <code>ColorGrading</code>. These are not in upstream <code>google/filament</code>.
+        </p>
         <ul>
           <li>gltfio UbershaderProvider — pre-built PBR shaders, no <code>matc</code> step</li>
           <li>Multi-axis rotation animated from buffer PTS via <code>rotation-period-*</code> props (software only — GLB animation tracks not played)</li>

@@ -357,6 +357,8 @@ All three PoCs use a `SkipVerify` TLS verifier — equivalent to `crypto_none` i
 
 FLUX depends on a fork of Filament — **[jesusluque/filament](https://github.com/jesusluque/filament)** — which extends the upstream `google/filament` with the HDR color spaces and Y'CbCr output needed by `fluxvideotex`.
 
+The changes were landed in [PR #1](https://github.com/jesusluque/filament/pull/1) (merge commit [`a7b0837`](https://github.com/jesusluque/filament/commit/a7b0837ba732260525944b8a60cc185d3c7c42ae)).
+
 The fork adds four files:
 
 | File | Changes |
