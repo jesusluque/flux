@@ -115,6 +115,8 @@ Each tile carries a `clockoverlay` showing wall-clock time to centisecond precis
 
 ### poc003 — fluxvideotex (live video texture on a 3D cube)
 
+![fluxvideotex — rotating cube with live SMPTE-bar video texture](docs/images/cube.jpg)
+
 ```bash
 # Build Filament plugin
 cd tools/filament
@@ -135,6 +137,26 @@ Displays a rotating 3D cube with live SMPTE-bar video rendered as a GPU texture 
 --color-space sdr|hlg|pq  HDR color space (default: sdr)
 --duration N              run for N seconds (default: 300)
 ```
+
+#### Run directly with gst-launch-1.0
+
+No build required — point `GST_PLUGIN_PATH` at the pre-built plugins and run:
+
+```bash
+GST_PLUGIN_PATH=/path/to/flux/tools/gstreamer/target/release:/path/to/flux/tools/filament/build/gst-fluxvideotex \
+gst-launch-1.0 \
+  videotestsrc pattern=smpte is-live=true \
+  ! videoconvert \
+  ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
+  ! fluxvideotex width=1280 height=720 \
+      rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 \
+      color-space=srgb ycbcr-output=false \
+  ! "video/x-raw,format=RGBA,width=1280,height=720" \
+  ! videoconvert \
+  ! glimagesink sync=false
+```
+
+To load a custom GLB model, add `glb-file=/path/to/model.glb` to the `fluxvideotex` properties.
 
 ---
 
@@ -321,6 +343,100 @@ Filament `readPixels` is asynchronous. The renderer calls `pumpMessageQueues()` 
 
 **TLS trust model (PoC)**  
 All three PoCs use a `SkipVerify` TLS verifier — equivalent to `crypto_none` in terms of authentication. Production use requires proper certificate validation wired to quinn's `ClientConfig`.
+
+---
+
+## Filament Renderer (`fluxvideotex`)
+
+[Filament](https://google.github.io/filament/) is Google's physically-based real-time rendering engine. FLUX uses it inside `fluxvideotex` to composite live video frames onto arbitrary 3D scenes entirely in software — no display server or windowing system required.
+
+### Architecture
+
+```
+GStreamer streaming thread          Owner thread (FilamentScene)
+─────────────────────────           ──────────────────────────────────────
+flux_videotex_transform()           owner_thread_loop()
+  │                                   waits on condvar
+  ├─ lazy-init: filament_scene_create()
+  │    └─ run_on_owner(filament_init)
+  │         Engine::create(OPENGL)     ← headless, no display
+  │         createSwapChain(CONFIG_READABLE)  ← offscreen
+  │         gltfio: parse GLB, load resources
+  │         UbershaderProvider: pre-built PBR materials
+  │         ColorGrading: output color space + YCbCr
+  │
+  └─ per-frame: filament_scene_render()
+       └─ run_on_owner(filament_render_frame)
+            upload RGBA → Texture::setImage()
+            setParameter("baseColorMap", videoTexture)
+            animate rotation (mat4f Euler)
+            renderer->render(view)
+            renderer->readPixels() → async DMA readback
+            pumpMessageQueues() until readback_done
+            vertical flip (Filament is bottom-up, GStreamer top-down)
+```
+
+All Filament calls are serialised on a single **owner thread** via a mutex + condvar work queue. This is required because Filament mandates that `Engine::create()` and `Engine::destroy()` execute on the same thread — which is not guaranteed between the GStreamer streaming thread and GLib's finalization thread.
+
+### Color space and ColorGrading
+
+Filament's `ColorGrading` API applies a post-processing LUT on the output. `fluxvideotex` exposes this as the `color-space` property, mapping directly to Filament's `(Gamut - TransferFunction - WhitePoint)` DSL:
+
+| `color-space` value | Filament expression | Use |
+|---------------------|--------------------|----|
+| `srgb` *(default)*  | `Rec709 - sRGB - D65` | Standard web / display |
+| `bt709`             | `Rec709 - BT709 - D65` | HD broadcast OETF |
+| `rec709-linear`     | `Rec709 - Linear - D65` | Linear light compositing |
+| `rec2020-linear`    | `Rec2020 - Linear - D65` | Wide-gamut linear |
+| `rec2020-pq`        | `Rec2020 - PQ - D65` | HDR10 / SMPTE ST.2084 |
+| `rec2020-hlg`       | `Rec2020 - HLG - D65` | HLG / ARIB STD-B67 |
+
+Changing `color-space` at runtime tears down and re-creates the Filament scene on the next buffer so the new `ColorGrading` object takes effect cleanly.
+
+### Y'CbCr output (`ycbcr-output`)
+
+When `ycbcr-output=true` Filament's `ColorGrading::ycbcrOutput()` stores the colour-graded result as packed `Y'CbCr` in the RGBA8 readback buffer (`R=Y'`, `G=Cb`, `B=Cr`, `A=1`). The element advertises `AYUV` on its src pad instead of `RGBA`, so downstream elements (encoders, muxers) receive a correct YCbCr signal without an extra `videoconvert` step.
+
+```
+# SDR RGBA output (default)
+! fluxvideotex color-space=srgb ycbcr-output=false
+! "video/x-raw,format=RGBA,..."
+
+# HDR HLG with Y'CbCr — feeds directly into an HLG-capable encoder
+! fluxvideotex color-space=rec2020-hlg ycbcr-output=true
+! "video/x-raw,format=AYUV,..."
+! avenc_dnxhd ...
+```
+
+### Custom GLB (`glb-file`)
+
+By default the built-in cube GLB (generated at CMake configure time by `gen_cube.py` → `xxd -i`, embedded as a C byte array in `cube_glb.h`) is used. Set `glb-file` to any GLB path to load a different model at runtime:
+
+```bash
+! fluxvideotex glb-file=/path/to/scene.glb ...
+```
+
+The GLB is loaded and parsed by `gltfio` on the owner thread at first-buffer time. Any material whose `baseColorTexture` URI is `flux://channel/0` (per spec §10.10) gets the live video feed; other materials are left untouched.
+
+Changing `glb-file` at runtime (via `g_object_set`) tears down and re-creates the scene on the next buffer.
+
+### gst-launch-1.0 command (your local build)
+
+```bash
+GST_PLUGIN_PATH=/Users/muriel/luc/flux/tools/gstreamer/target/release:/Users/muriel/luc/flux/tools/filament/build/gst-fluxvideotex \
+gst-launch-1.0 \
+  videotestsrc pattern=smpte is-live=true \
+  ! videoconvert \
+  ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
+  ! fluxvideotex width=1280 height=720 \
+      rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 \
+      color-space=srgb ycbcr-output=false \
+  ! "video/x-raw,format=RGBA,width=1280,height=720" \
+  ! videoconvert \
+  ! glimagesink sync=false
+```
+
+Swap `color-space=rec2020-hlg ycbcr-output=true` and change the caps format to `AYUV` for an HLG signal. Add `glb-file=/path/to/model.glb` to use a custom scene.
 
 ---
 

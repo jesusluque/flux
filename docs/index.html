@@ -164,6 +164,36 @@
     }
     .element span { font-size: .8rem; color: var(--muted); }
 
+    /* ─── FILAMENT ─── */
+    .filament-hero {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 2.5rem;
+      align-items: start; margin-bottom: 3rem;
+    }
+    @media (max-width: 760px) { .filament-hero { grid-template-columns: 1fr; } }
+    .filament-screenshot {
+      border-radius: 10px; overflow: hidden; border: 1px solid var(--border);
+      line-height: 0;
+    }
+    .filament-screenshot img { width: 100%; display: block; }
+    .filament-desc p { margin-bottom: .9rem; }
+    .filament-desc ul { list-style: none; padding: 0; }
+    .filament-desc li { padding: .3rem 0; color: #9aa3b8; font-size: .9rem; }
+    .filament-desc li::before { content: "→ "; color: var(--accent); }
+
+    .cs-table { width: 100%; border-collapse: collapse; font-size: .85rem; margin: 1.2rem 0 2rem; }
+    .cs-table th, .cs-table td { padding: .5rem .9rem; border-bottom: 1px solid var(--border); text-align: left; }
+    .cs-table th { background: var(--surface2); color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .07em; }
+    .cs-table td:first-child { font-family: "SF Mono", Menlo, monospace; font-size: .8rem; color: var(--accent); white-space: nowrap; }
+    .cs-table tr:last-child td { border-bottom: none; }
+
+    .cmd-block {
+      background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+      padding: 1.1rem 1.3rem; overflow-x: auto; margin: 1rem 0;
+    }
+    .cmd-block pre { margin: 0; font-family: "SF Mono", Menlo, monospace; font-size: .78rem;
+      color: #b0c4e8; line-height: 1.7; white-space: pre; }
+    .cmd-block .cm { color: var(--muted); }
+
     /* ─── CODECS ─── */
     .codec-groups { display: flex; gap: 2rem; flex-wrap: wrap; }
     .codec-group { flex: 1; min-width: 180px; }
@@ -234,6 +264,7 @@
   <a href="#pillars">Pillars</a>
   <a href="#comparison">Compare</a>
   <a href="#elements">Elements</a>
+  <a href="#filament">Filament</a>
   <a href="#embed">FLUX-E</a>
   <a href="#status">Status</a>
   <a href="https://github.com/jesusluque/flux">GitHub</a>
@@ -504,6 +535,102 @@
       <div class="element"><code>fluxgsresidualdec</code><span>GS residual decoder</span></div>
       <div class="element"><code>fluxframer</code><span>FLUX frame packetizer</span></div>
     </div>
+  </div>
+</section>
+
+</section>
+
+<!-- FILAMENT RENDERER -->
+<section id="filament">
+  <div class="container">
+    <h2>Filament Renderer — <code>fluxvideotex</code></h2>
+
+    <div class="filament-hero">
+      <div class="filament-screenshot">
+        <img src="images/cube.jpg" alt="fluxvideotex — rotating cube with live SMPTE-bar video texture rendered by Filament" />
+      </div>
+      <div class="filament-desc">
+        <p>
+          <code>fluxvideotex</code> uses <a href="https://google.github.io/filament/" target="_blank">Filament</a>
+          — Google's physically-based real-time rendering engine — as a headless offscreen compositor.
+          Each incoming RGBA video frame is uploaded as a GPU texture, set as the
+          <code>baseColorMap</code> of every material instance in the loaded GLB scene,
+          and the result is rendered and read back as a GStreamer buffer.
+        </p>
+        <p>
+          The element runs entirely in software: no display server, no window, no GPU display output.
+          The OpenGL context is headless (<code>Engine::Backend::OPENGL</code>) with an offscreen
+          <code>SwapChain</code> configured <code>CONFIG_READABLE</code> for DMA readback.
+        </p>
+        <ul>
+          <li>gltfio UbershaderProvider — pre-built PBR shaders, no <code>matc</code> step</li>
+          <li>Multi-axis rotation animated from buffer PTS</li>
+          <li>Async <code>readPixels</code> with <code>pumpMessageQueues()</code> spin (macOS)</li>
+          <li>Vertical flip on readback (Filament is bottom-up; GStreamer top-down)</li>
+          <li>Thread-safe owner-thread model — all Filament calls on one dedicated thread</li>
+          <li>Live property changes tear down and rebuild the scene cleanly</li>
+        </ul>
+      </div>
+    </div>
+
+    <h3>Color space — <code>color-space</code> property</h3>
+    <p>
+      Filament's <code>ColorGrading</code> post-processing is configured at scene creation time.
+      The <code>color-space</code> property maps directly to the Filament
+      <code>(Gamut&nbsp;-&nbsp;TransferFunction&nbsp;-&nbsp;WhitePoint)</code> DSL:
+    </p>
+    <table class="cs-table">
+      <thead><tr><th>Value</th><th>Filament expression</th><th>Use</th></tr></thead>
+      <tbody>
+        <tr><td>srgb <em>(default)</em></td><td>Rec709 - sRGB - D65</td><td>Standard web / display</td></tr>
+        <tr><td>bt709</td><td>Rec709 - BT709 - D65</td><td>HD broadcast OETF</td></tr>
+        <tr><td>rec709-linear</td><td>Rec709 - Linear - D65</td><td>Linear light compositing</td></tr>
+        <tr><td>rec2020-linear</td><td>Rec2020 - Linear - D65</td><td>Wide-gamut linear</td></tr>
+        <tr><td>rec2020-pq</td><td>Rec2020 - PQ - D65</td><td>HDR10 / SMPTE ST.2084</td></tr>
+        <tr><td>rec2020-hlg</td><td>Rec2020 - HLG - D65</td><td>HLG / ARIB STD-B67</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Y'CbCr output — <code>ycbcr-output</code> property</h3>
+    <p>
+      When <code>ycbcr-output=true</code>, Filament's <code>ColorGrading::ycbcrOutput()</code>
+      encodes the colour-graded result as packed Y'CbCr into the RGBA8 readback buffer
+      (<code>R=Y'</code>, <code>G=Cb</code>, <code>B=Cr</code>, <code>A=1</code>).
+      The element advertises <code>AYUV</code> on its src pad so downstream encoders and
+      muxers receive the correct signal with no extra <code>videoconvert</code> step.
+    </p>
+
+    <h3>Custom GLB — <code>glb-file</code> property</h3>
+    <p>
+      The default scene is a unit cube with <code>KHR_materials_unlit</code> and
+      <code>baseColorTexture.uri = "flux://channel/0"</code>, generated at build time
+      by <code>gen_cube.py</code> and embedded as a C byte array via <code>xxd&nbsp;-i</code>.
+      Set <code>glb-file</code> to any GLB path to use a different model — any material
+      whose <code>baseColorTexture</code> URI is <code>flux://channel/0</code> receives
+      the live video feed; other materials are untouched.
+    </p>
+
+    <h3>Run with <code>gst-launch-1.0</code></h3>
+    <div class="cmd-block"><pre><span class="cm">// SDR — default</span>
+GST_PLUGIN_PATH=/path/to/flux/tools/gstreamer/target/release:\
+               /path/to/flux/tools/filament/build/gst-fluxvideotex \
+gst-launch-1.0 \
+  videotestsrc pattern=smpte is-live=true \
+  ! videoconvert \
+  ! "video/x-raw,format=RGBA,width=1280,height=720,framerate=30/1" \
+  ! fluxvideotex width=1280 height=720 \
+      rotation-period-x=150 rotation-period-y=200 rotation-period-z=300 \
+      color-space=srgb ycbcr-output=false \
+  ! "video/x-raw,format=RGBA,width=1280,height=720" \
+  ! videoconvert \
+  ! glimagesink sync=false
+
+<span class="cm">// HLG — Y'CbCr output, custom GLB</span>
+  ! fluxvideotex color-space=rec2020-hlg ycbcr-output=true \
+      glb-file=/path/to/scene.glb \
+  ! "video/x-raw,format=AYUV,width=1280,height=720" \
+  ! videoconvert ! ...</pre></div>
+
   </div>
 </section>
 
