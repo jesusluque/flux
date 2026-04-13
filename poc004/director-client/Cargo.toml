@@ -1,0 +1,22 @@
+[package]
+name    = "director-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gstreamer       = { workspace = true }
+gstreamer-base  = { workspace = true }
+gstreamer-app   = { workspace = true }
+tokio           = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }
+bytes           = { workspace = true }
+log             = { workspace = true }
+env_logger      = { workspace = true }
+libc            = { workspace = true }
+ctrlc           = { workspace = true }
+flux-framing    = { workspace = true }
+gst-fluxdeframer = { workspace = true }
+gst-fluxsrc     = { workspace = true }
+gst-fluxdemux   = { workspace = true }
+gst-fluxcdbc    = { workspace = true }

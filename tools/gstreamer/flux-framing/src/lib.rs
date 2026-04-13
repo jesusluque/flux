@@ -799,6 +799,118 @@ impl FluxControl {
     }
 }
 
+// ─── FLUX-T Tally (spec §8) ───────────────────────────────────────────────────
+
+/// Per-channel tally state carried in a `TALLY_UPDATE` datagram (spec §8.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TallyChannelState {
+    pub program: bool,
+    pub preview: bool,
+    pub standby: bool,
+    #[serde(default)]
+    pub iso_rec: bool,
+    #[serde(default)]
+    pub streaming: bool,
+}
+
+/// `TALLY_UPDATE (0xA)` datagram — sent client → server (spec §8.1).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TallyUpdate {
+    pub session_id: String,
+    pub ts_ns: u64,
+    /// Channel states keyed by channel index (serialised as string keys).
+    pub channels: std::collections::HashMap<String, TallyChannelState>,
+    pub mixer_id: String,
+    /// `"cut"` | `"mix"` — type of transition that triggered this update.
+    pub transition: String,
+}
+
+impl TallyUpdate {
+    /// Encode into a complete FLUX datagram using `FrameType::TallyUpdate (0xA)`.
+    pub fn encode_datagram(&self) -> Vec<u8> {
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        let hdr = FluxHeader {
+            version: FLUX_VERSION,
+            frame_type: FrameType::TallyUpdate,
+            flags: 0,
+            channel_id: 0,
+            layer: 0,
+            frag: 0,
+            group_id: 0,
+            group_timestamp_ns: self.ts_ns,
+            presentation_ts: 0,
+            capture_ts_ns_lo: 0,
+            payload_length: body.len() as u32,
+            fec_group: 0,
+            sequence_in_group: 0,
+        };
+        let mut dg = Vec::with_capacity(HEADER_SIZE + body.len());
+        dg.extend_from_slice(&hdr.encode());
+        dg.extend_from_slice(&body);
+        dg
+    }
+
+    /// Try to parse a `TallyUpdate` from the body (everything after the header).
+    pub fn decode_body(body: &[u8]) -> Option<Self> {
+        serde_json::from_slice(body).ok()
+    }
+}
+
+/// `tally_confirm` datagram — sent server → client (spec §8.3).
+///
+/// Encoded as a `MetadataFrame (0xC)` datagram; the `"type": "tally_confirm"`
+/// field distinguishes it from per-frame media metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TallyConfirm {
+    /// Always `"tally_confirm"`.
+    #[serde(rename = "type")]
+    pub msg_type: String,
+    /// Channel index that changed state.
+    pub channel: u8,
+    /// `"program"` | `"preview"` | `"standby"` | `"idle"`.
+    pub state: String,
+    /// Display colour as HTML hex, e.g. `"#FF0000"` for program.
+    pub color: String,
+    /// Short human label, e.g. `"PGM"` or `"PVW"`.
+    pub label: String,
+}
+
+impl TallyConfirm {
+    /// Encode into a complete FLUX datagram using `FrameType::MetadataFrame (0xC)`.
+    pub fn encode_datagram(&self, ts_ns: u64) -> Vec<u8> {
+        let body = serde_json::to_vec(self).unwrap_or_default();
+        let hdr = FluxHeader {
+            version: FLUX_VERSION,
+            frame_type: FrameType::MetadataFrame,
+            flags: 0,
+            channel_id: self.channel as u16,
+            layer: 0,
+            frag: 0,
+            group_id: 0,
+            group_timestamp_ns: ts_ns,
+            presentation_ts: 0,
+            capture_ts_ns_lo: 0,
+            payload_length: body.len() as u32,
+            fec_group: 0,
+            sequence_in_group: 0,
+        };
+        let mut dg = Vec::with_capacity(HEADER_SIZE + body.len());
+        dg.extend_from_slice(&hdr.encode());
+        dg.extend_from_slice(&body);
+        dg
+    }
+
+    /// Try to parse a `TallyConfirm` from a datagram body.
+    pub fn decode_body(body: &[u8]) -> Option<Self> {
+        let v: Self = serde_json::from_slice(body).ok()?;
+        if v.msg_type == "tally_confirm" {
+            Some(v)
+        } else {
+            None
+        }
+    }
+}
+
 /// BANDWIDTH_PROBE payload (spec §5.3 / frame type 0xD)
 ///
 /// Sent server → client as a padded datagram; the client measures the

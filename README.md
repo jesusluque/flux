@@ -44,6 +44,7 @@ flux/
 ├── poc001/                                Unicast H.265 + CDBC + FLUX-C
 ├── poc002/                                Four-stream mosaic + MSS
 ├── poc003/                                fluxvideotex live video texture
+├── poc004/                                Camera switcher + bidirectional tally (FLUX-T)
 └── docs/                                  GitHub Pages site
 ```
 
@@ -112,6 +113,30 @@ Each tile carries a `clockoverlay` showing wall-clock time to centisecond precis
 
 **Server controls:** `1`–`4` select stream · `+`/`-` inject 10 ms delay · `R` reset · `S` status · `Q` quit  
 **Client controls:** `Space` pause/resume · `S` sync stats · `Q` quit
+
+### poc004 — Camera switcher with bidirectional tally (FLUX-T)
+
+```bash
+cd tools/gstreamer && cargo build --release && cd ../..
+
+# Terminal 1 — switcher server (4 cameras, port 7410)
+cd poc004 && cargo run --bin switcher-server --release
+
+# Terminal 2 — director client
+cd poc004 && cargo run --bin director-client --release
+```
+
+The switcher server runs four independent H.265 encode pipelines (SMPTE bars, pinwheel, ball, snow) each terminating in an `appsink`. A router task forwards only the active camera's FLUX-framed buffers into a single `appsrc → fluxsink` output on port 7410.
+
+Cuts are committed on the next IDR keyframe (`!DELTA_UNIT`) after a switch is requested, so the client decoder always receives a clean GOP boundary.
+
+**Server keyboard controls:** `1`–`4` cut to camera · `T` tally table · `H` help · `Q` quit
+
+**Client keyboard controls:** `1`–`4` cut to camera (sends `FluxControl{routing}` + `TALLY_UPDATE`) · `Q` quit
+
+**Bidirectional tally (spec §8):**
+- Client → Server: `TALLY_UPDATE (0xA)` datagram with `program`/`preview` channel states
+- Server → Client: `tally_confirm` JSON in `MetadataFrame (0xC)` datagram, sent after each committed cut
 
 ### poc003 — fluxvideotex (live video texture on a 3D cube)
 
@@ -228,11 +253,11 @@ This loads the built-in cube with the default rotation periods (150 s / 200 s / 
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| TallyUpdate frame type (0xA) | ✅ | Defined in `flux-framing` |
+| TallyUpdate frame type (0xA) | ✅ | `flux-framing`; `TallyUpdate::encode_datagram()` |
 | `tally_support` capability flag | ✅ | In SessionRequest |
-| JSON tally mode (§8.1) | 🔶 | Frame type dispatched; no standalone `fluxtally` element yet |
+| JSON tally mode C→S (§8.1) | ✅ | Sent by director-client (poc004) via `fluxsrc.send_datagram()` |
+| Server→client `tally_confirm` S→C (§8.3) | ✅ | `TallyConfirm` in `MetadataFrame (0xC)`; sent by switcher-server (poc004) via `fluxsink.send_datagram()` |
 | Compact 3-bit binary mode (§8.2) | ❌ | Not implemented |
-| Downstream server→client tally (§8.3) | ❌ | Not implemented |
 
 ### FLUX-M — Monitor Stream (§9)
 
@@ -498,7 +523,7 @@ Loads the built-in cube with default rotation periods. Add `rotation-period-x=N 
 | §5 | CDBC, BwGovernor | ✅ (§5.5 per-layer priority ❌) |
 | §6 | MSS, sync barrier, SYNC_ANCHOR | ✅ barrier · 🔶 SYNC_ANCHOR |
 | §7 | FLUX-D discovery | ❌ |
-| §8 | FLUX-T tally | 🔶 frame type only |
+| §8 | FLUX-T tally | ✅ JSON C→S + S→C (poc004) · 🔶 compact binary ❌ |
 | §9 | FLUX-M monitor stream | 🔶 flags/caps only |
 | §10 | FLUX-E embedding | ✅ video texture · ❌ manifest/chunks |
 | §10.9 | GS Residual Codec Framework | ❌ |

@@ -802,7 +802,8 @@ gst-launch-1.0 \
         <tr><td>Default port constants (7400/7401/7500)</td><td class="s-ok">✓</td><td><code>flux-framing</code></td></tr>
         <tr><td>DNS-SD / mDNS (§7.1)</td><td class="s-no">✗</td><td>—</td></tr>
         <tr><td>HTTP/JSON Registry (§7.2)</td><td class="s-no">✗</td><td>—</td></tr>
-        <tr><td>TallyUpdate frame type + capability flag</td><td class="s-part">~</td><td>Frame type dispatched; no <code>fluxtally</code> element yet</td></tr>
+        <tr><td>TallyUpdate (0xA) JSON C→S (§8.1)</td><td class="s-ok">✓</td><td>poc004 director-client — <code>TallyUpdate::encode_datagram()</code></td></tr>
+        <tr><td>tally_confirm S→C (§8.3)</td><td class="s-ok">✓</td><td>poc004 switcher-server — <code>TallyConfirm</code> in MetadataFrame (0xC)</td></tr>
         <tr><td>Compact 3-bit tally binary mode (§8.2)</td><td class="s-no">✗</td><td>—</td></tr>
         <tr><td>MONITOR_COPY flag + monitor_stream_id cap</td><td class="s-part">~</td><td>Flags/caps present; sub-stream not generated</td></tr>
       </table>
@@ -832,7 +833,7 @@ gst-launch-1.0 \
         <tr><td>MetadataFrame (0xC) encode/decode</td><td class="s-ok">✓</td><td><code>flux-framing</code></td></tr>
         <tr><td>PTZ command</td><td class="s-ok">✓</td><td>Sent by poc001; logged by server</td></tr>
         <tr><td>audio_mix command</td><td class="s-ok">✓</td><td>Sent by poc001; logged by server</td></tr>
-        <tr><td>routing command</td><td class="s-ok">✓</td><td>Sent by poc001; logged by server</td></tr>
+        <tr><td>routing command</td><td class="s-ok">✓</td><td>Sent by poc001 (FLUX-C) and poc004 director-client</td></tr>
         <tr><td>test_pattern command</td><td class="s-ok">✓</td><td>Live pattern switch via videotestsrc</td></tr>
         <tr><td>Rate limiting (§12.1)</td><td class="s-no">✗</td><td>Field defined; not enforced</td></tr>
       </table>

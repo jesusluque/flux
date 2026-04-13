@@ -52,6 +52,17 @@ impl FluxSink {
         imp::FluxSink::from_obj(self).set_flux_control_tx(tx);
         rx
     }
+
+    /// Send an arbitrary datagram to the connected client (S→C direction).
+    ///
+    /// Used by poc004 to deliver `tally_confirm` datagrams back to the director
+    /// client without going through the GStreamer media pipeline.
+    /// Returns `true` if the datagram was queued, `false` if no client is
+    /// connected or the send queue is full.
+    pub fn send_datagram(&self, data: Vec<u8>) -> bool {
+        use gstreamer::subclass::prelude::ObjectSubclassExt;
+        imp::FluxSink::from_obj(self).send_datagram_inner(bytes::Bytes::from(data))
+    }
 }
 
 mod imp {
@@ -135,6 +146,20 @@ mod imp {
             tx: std::sync::mpsc::SyncSender<flux_framing::FluxControl>,
         ) {
             *self.inner.lock().unwrap().flux_control_tx.lock().unwrap() = Some(tx);
+        }
+
+        /// Send a raw datagram to the currently-connected client (S→C).
+        /// Returns `true` if the datagram was queued, `false` if no client is
+        /// connected or the QUIC send queue is full.
+        pub(super) fn send_datagram_inner(&self, bytes: Bytes) -> bool {
+            // Clone the Arc<Mutex<Option<Connection>>> while holding inner lock,
+            // then release inner lock before acquiring the connection lock.
+            let conn_arc = self.inner.lock().unwrap().connection.clone();
+            let guard = conn_arc.lock().unwrap();
+            match guard.as_ref() {
+                Some(c) => c.send_datagram(bytes).is_ok(),
+                None => false,
+            }
         }
     }
 
