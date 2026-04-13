@@ -841,9 +841,13 @@ mod imp {
         conn: quinn::Connection,
         raw_tx: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
     ) {
+        gst::debug!(cat(), "[fluxsrc/uni] run_stream_announce_listener started");
         loop {
             let mut recv = match conn.accept_uni().await {
-                Ok(r) => r,
+                Ok(r) => {
+                    gst::debug!(cat(), "[fluxsrc/uni] accepted a uni-stream");
+                    r
+                }
                 Err(e) => {
                     gst::warning!(cat(), "[fluxsrc/uni] accept_uni error: {}", e);
                     break;
@@ -885,9 +889,9 @@ mod imp {
 
             match hdr.frame_type {
                 flux_framing::FrameType::MediaData => {
-                    gst::info!(
+                    gst::trace!(
                         cat(),
-                        "[fluxsrc/uni] MediaData len={} keyframe={} seq={}",
+                        "[fluxsrc/uni] MediaData len={} keyframe={} seq={} — forwarding to raw_tx",
                         data.len(), hdr.is_keyframe(), hdr.sequence_in_group
                     );
                     // Forward to the GStreamer pipeline via raw_tx.
@@ -979,7 +983,7 @@ mod imp {
                     return Ok(None);
                 }
             };
-            gst::info!(
+            gst::debug!(
                 cat(),
                 "[fluxsrc/push] building GstBuffer frame_type={:?} len={}",
                 hdr.frame_type, data.len()
@@ -990,17 +994,26 @@ mod imp {
             {
                 let buf_ref = buf.get_mut().unwrap();
 
-                // Fix 3: Stamp DISCONT on the very first buffer of each new
-                // session so fluxdeframer → h265parse → vtdec_hw know the
-                // reference picture chain has been reset.
-                let discont = {
+                // Set DISCONT on the GstBuffer only when the reference chain is
+                // actually broken:
+                //   • session_discont: first buffer of a new session (reconnect)
+                //   • hdr.is_discont(): FLUX header DISCONT flag set by the
+                //     server router only on the IDR that follows a camera switch
+                //
+                // Normal periodic IDRs do NOT break the reference chain — do NOT
+                // set DISCONT on them, or vtdec_hw will flush and then error on
+                // the delta frames it already submitted before the flush.
+                let session_discont = {
                     let mut s = self.inner.lock().unwrap();
                     let d = s.pending_discont;
                     s.pending_discont = false;
                     d
                 };
-                if discont {
+                if session_discont || hdr.is_discont() {
                     buf_ref.set_flags(gst::BufferFlags::DISCONT);
+                }
+                if !hdr.is_keyframe() {
+                    buf_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
                 }
 
                 let mut map = buf_ref.map_writable().map_err(|_| FlowError::Error)?;

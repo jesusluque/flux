@@ -1437,6 +1437,7 @@ dependencies = [
  "gstreamer",
  "gstreamer-app",
  "gstreamer-base",
+ "gstreamer-video",
  "libc",
  "log",
  "serde",

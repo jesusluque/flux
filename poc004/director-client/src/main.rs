@@ -6,7 +6,8 @@
 //! Pipeline:
 //!   fluxsrc(port=7410)
 //!     → fluxdemux
-//!         media_0 → fluxcdbc → fluxdeframer → h265parse → vtdec_hw
+//!         media_0 → fluxcdbc → queue → fluxdeframer → h265parse
+//!                → video/x-h265,stream-format=hvc1 → vtdec_hw
 //!                → videoconvertscale → osxvideosink
 //!         control → appsink  (receives tally_confirm datagrams)
 //!         cdbc    → fakesink
@@ -153,6 +154,20 @@ fn run(tty: Option<Tty>) {
     }
 
     // ── Decode chain ───────────────────────────────────────────────────────────
+    // Queue between fluxcdbc and fluxdeframer decouples the GStreamer streaming
+    // thread from fluxdeframer's PTS-stamping work — same rationale as poc002.
+    // Without this, fluxdeframer can block the chain() call that fluxsrc/fluxcdbc
+    // runs on, causing frame stalls that manifest as a green screen.
+    let decode_queue = gst::ElementFactory::make("queue")
+        .name("decode_queue")
+        .property("max-size-buffers", 8u32)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-time", 0u64)
+        // leaky=downstream: drop oldest when full rather than blocking.
+        .property_from_str("leaky", "downstream")
+        .build()
+        .expect("decode queue");
+
     let fluxdeframer = gst::ElementFactory::make("fluxdeframer")
         .name("fluxdeframer")
         .build()
@@ -201,6 +216,7 @@ fn run(tty: Option<Tty>) {
             fluxsrc_elem,
             &fluxdemux,
             fluxcdbc_elem,
+            &decode_queue,
             &fluxdeframer,
             &h265parse,
             &vtdec,
@@ -214,16 +230,57 @@ fn run(tty: Option<Tty>) {
     // Static: src → demux
     fluxsrc_elem.link(&fluxdemux).expect("fluxsrc → fluxdemux");
 
-    // Static: decode chain (cdbc→deframer→parse→vtdec→convert→sink)
+    // Static: decode chain (cdbc→queue→deframer→parse→vtdec→convert→sink)
     fluxcdbc_elem
+        .link(&decode_queue)
+        .expect("fluxcdbc → decode_queue");
+    decode_queue
         .link(&fluxdeframer)
-        .expect("fluxcdbc → fluxdeframer");
+        .expect("decode_queue → fluxdeframer");
     fluxdeframer
         .link(&h265parse)
         .expect("fluxdeframer → h265parse");
-    h265parse.link(&vtdec).expect("h265parse → vtdec");
+    // vtdec_hw on macOS requires hvc1 (length-delimited) format, not byte-stream.
+    h265parse
+        .link_filtered(
+            &vtdec,
+            &gst::Caps::builder("video/x-h265")
+                .field("stream-format", "hvc1")
+                .field("alignment", "au")
+                .build(),
+        )
+        .expect("h265parse → vtdec (hvc1)");
     vtdec.link(&convert).expect("vtdec → convert");
     convert.link(&osxvideosink).expect("convert → sink");
+
+    // ── Segment-event filter on vtdec sink pad ─────────────────────────────────
+    // h265parse re-emits a stream-start + caps + segment event sequence every
+    // time it sees new SPS/PPS parameters (i.e. on every camera switch), even
+    // when the parameters are identical.  The Segment event triggers
+    // GstVideoDecoder::gst_video_decoder_reset() inside vtdec_hw, which flushes
+    // its 16-frame async VideoToolbox pipeline and produces ~27 "Got frame N
+    // with an error flag" errors per cut.
+    //
+    // Fix: install a pad probe on vtdec's sink pad that drops all Segment events
+    // after the very first one (which is needed for initial pipeline setup).
+    // vtdec_hw does NOT need a new Segment to decode an IDR from a different
+    // camera when the video parameters (resolution, profile, level) are unchanged
+    // — the DISCONT flag on the buffer is sufficient for it to resync.
+    {
+        let segment_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vtdec_sink = vtdec.static_pad("sink").expect("vtdec sink pad");
+        vtdec_sink.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
+                if ev.type_() == gst::EventType::Segment {
+                    if segment_seen.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        // Drop all Segment events after the first.
+                        return gst::PadProbeReturn::Drop;
+                    }
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 
     // Dynamic demux pad routing.
     let cdbc_sink_pad = fluxcdbc_elem.static_pad("sink").expect("fluxcdbc sink");
@@ -386,6 +443,7 @@ fn run(tty: Option<Tty>) {
                     ml2.quit();
                     return glib::ControlFlow::Break;
                 }
+                MessageView::StateChanged(_) => {}
                 _ => {}
             }
             glib::ControlFlow::Continue

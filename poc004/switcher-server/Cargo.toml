@@ -7,6 +7,7 @@ edition = "2021"
 gstreamer       = { workspace = true }
 gstreamer-base  = { workspace = true }
 gstreamer-app   = { workspace = true }
+gstreamer-video = { workspace = true }
 tokio           = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }

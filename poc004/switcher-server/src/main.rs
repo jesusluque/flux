@@ -25,10 +25,12 @@
 //!   Q    quit
 //!   H    help
 
+use flux_framing::flags as flux_flags;
 use gst::glib;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -110,13 +112,15 @@ fn main() {
 fn run(tty: Option<Tty>) {
     // ── Build 4 encode pipelines ──────────────────────────────────────────────
     let mut cam_pipelines: Vec<gst::Pipeline> = Vec::with_capacity(N);
-    let mut cam_sinks: Vec<gst_app::AppSink> = Vec::with_capacity(N);
+    let mut cam_sinks_vec: Vec<gst_app::AppSink> = Vec::with_capacity(N);
 
     for i in 0..N {
         let (pipeline, appsink) = build_cam_pipeline(i);
         cam_pipelines.push(pipeline);
-        cam_sinks.push(appsink);
+        cam_sinks_vec.push(appsink);
     }
+
+    let cam_sinks = Arc::new(cam_sinks_vec);
 
     // ── Build output pipeline: appsrc → fluxsink ──────────────────────────────
     let (out_pipeline, router_src, flux_sink) = build_output_pipeline();
@@ -129,10 +133,23 @@ fn run(tty: Option<Tty>) {
     let pending_channel = Arc::new(AtomicU32::new(0));
 
     // ── Start all pipelines ───────────────────────────────────────────────────
+    // set_state() is async for live pipelines — call get_state() with a 5 s
+    // timeout so the router thread never starts polling appsinks before the
+    // encode pipelines have actually reached PLAYING (which causes all
+    // try_pull_sample() calls to return NULL indefinitely → green screen).
     for (i, pl) in cam_pipelines.iter().enumerate() {
         pl.set_state(gst::State::Playing)
             .expect("cam pipeline Playing");
-        log!("[switcher-server] CAM {} encode pipeline started", i + 1);
+        let (change, cur, _pend) = pl.state(gst::ClockTime::from_seconds(5));
+        match change {
+            Ok(_) => {}
+            Err(e) => panic!("CAM {} pipeline failed to reach PLAYING: {:?}", i + 1, e),
+        }
+        log!(
+            "[switcher-server] CAM {} encode pipeline PLAYING (cur={:?})",
+            i + 1,
+            cur
+        );
     }
     out_pipeline
         .set_state(gst::State::Playing)
@@ -150,6 +167,7 @@ fn run(tty: Option<Tty>) {
         let pending_channel = pending_channel.clone();
         let state = state.clone();
         let flux_sink_weak = flux_sink.downgrade();
+        let cam_sinks_ctrl = cam_sinks.clone();
         std::thread::spawn(move || {
             run_control_task(
                 ctrl_rx,
@@ -157,6 +175,7 @@ fn run(tty: Option<Tty>) {
                 pending_channel,
                 state,
                 flux_sink_weak,
+                cam_sinks_ctrl,
             );
         });
     }
@@ -168,9 +187,10 @@ fn run(tty: Option<Tty>) {
         let pending_channel = pending_channel.clone();
         let flux_sink_weak = flux_sink.downgrade();
         let router_src = router_src.clone();
+        let cam_sinks_router = cam_sinks.clone();
         std::thread::spawn(move || {
             run_router(
-                cam_sinks,
+                cam_sinks_router,
                 router_src,
                 state,
                 pending_switch,
@@ -223,6 +243,7 @@ fn run(tty: Option<Tty>) {
         let state2 = state.clone();
         let ps = pending_switch.clone();
         let pc = pending_channel.clone();
+        let cs = cam_sinks.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(20), move || {
             while let Ok(ch) = rx.try_recv() {
                 match ch {
@@ -231,7 +252,7 @@ fn run(tty: Option<Tty>) {
                         ml.quit();
                         return glib::ControlFlow::Break;
                     }
-                    _ => handle_key(ch, &state2, &ps, &pc),
+                    _ => handle_key(ch, &state2, &ps, &pc, &cs),
                 }
             }
             glib::ControlFlow::Continue
@@ -441,7 +462,7 @@ fn build_output_pipeline() -> (gst::Pipeline, gst_app::AppSrc, gstfluxsink::Flux
 // ── Router task ───────────────────────────────────────────────────────────────
 
 fn run_router(
-    cam_sinks: Vec<gst_app::AppSink>,
+    cam_sinks: Arc<Vec<gst_app::AppSink>>,
     router_src: gst_app::AppSrc,
     state: Arc<Mutex<SwitcherState>>,
     pending_switch: Arc<AtomicBool>,
@@ -451,80 +472,155 @@ fn run_router(
     use flux_framing::{now_ns, TallyConfirm};
 
     log!("[router] started");
+    let mut diag_tick = std::time::Instant::now();
+    let mut diag_pulled = [0u32; N];
+    let mut diag_pushed: u32 = 0;
+    // Tracks when the current go-silent window began.  The switch-IDR is only
+    // committed once the silence has lasted ≥600 ms, which guarantees that
+    // vtdec_hw's 16-frame async VideoToolbox pipeline (~533 ms at 30 fps) is
+    // fully drained before the DISCONT switch-IDR arrives.  An empty pipeline
+    // means the DISCONT-triggered flush has nothing to abandon → zero error frames.
+    let mut silence_started: Option<std::time::Instant> = None;
     loop {
-        // Collect one sample from each cam sink (non-blocking).
-        let mut samples: [Option<gst_app::gst::Sample>; N] = Default::default();
-        for (i, sink) in cam_sinks.iter().enumerate() {
-            samples[i] = sink.try_pull_sample(gst::ClockTime::from_mseconds(1));
+        let active = state.lock().unwrap().active as usize;
+        let is_pending = pending_switch.load(Ordering::Acquire);
+        let new_cam = if is_pending {
+            pending_channel.load(Ordering::Acquire) as usize
+        } else {
+            active
+        };
+
+        // Record when the go-silent window starts (first iteration is_pending=true).
+        if is_pending {
+            if silence_started.is_none() {
+                silence_started = Some(std::time::Instant::now());
+                log!("[router] silence window started (waiting ≥600 ms before cut)");
+            }
+        } else {
+            // No pending switch — clear the timer.
+            silence_started = None;
         }
 
-        let active = state.lock().unwrap().active as usize;
+        // Pull only the cameras we actually need this iteration:
+        //   - always pull the current active camera (keep it drained so its
+        //     appsink never fills up and drops while we wait for an IDR)
+        //   - when a switch is pending, also pull the incoming camera
+        //   - skip all other cameras entirely to avoid wasting time on 1ms
+        //     timeouts that would stall the active-camera push path
+        let active_sample: Option<gst_app::gst::Sample>;
+        let mut incoming_sample: Option<gst_app::gst::Sample> = None;
 
-        if let Some(ref sample) = samples[active] {
+        active_sample = cam_sinks[active].try_pull_sample(gst::ClockTime::from_mseconds(1));
+        if active_sample.is_some() {
+            diag_pulled[active] += 1;
+        }
+
+        if is_pending && new_cam != active {
+            incoming_sample = cam_sinks[new_cam].try_pull_sample(gst::ClockTime::from_mseconds(1));
+            if incoming_sample.is_some() {
+                diag_pulled[new_cam] += 1;
+            }
+        }
+
+        // Print diagnostics every 2 seconds.
+        if diag_tick.elapsed().as_secs() >= 2 {
+            log!(
+                "[router/diag] pulled per-cam: {:?}  pushed: {}",
+                diag_pulled,
+                diag_pushed
+            );
+            diag_pulled = [0u32; N];
+            diag_pushed = 0;
+            diag_tick = std::time::Instant::now();
+        }
+
+        // Check if a pending switch can be committed: we need a keyframe from
+        // the *incoming* camera (not the currently active one) AND the silence
+        // window must have lasted at least 600 ms so vtdec_hw's async pipeline
+        // is fully drained before the DISCONT switch-IDR arrives.
+        if is_pending {
+            let silence_ok = silence_started
+                .map(|t| t.elapsed() >= std::time::Duration::from_millis(600))
+                .unwrap_or(false);
+
+            if let Some(ref inc) = incoming_sample {
+                if let Some(incoming_buf) = inc.buffer() {
+                    let incoming_keyframe =
+                        !incoming_buf.flags().contains(gst::BufferFlags::DELTA_UNIT);
+                    if incoming_keyframe && silence_ok {
+                        pending_switch.store(false, Ordering::Release);
+                        silence_started = None;
+
+                        // Commit the switch.
+                        let confirmed_cam;
+                        {
+                            let mut st = state.lock().unwrap();
+                            for i in 0..N {
+                                st.tally[i] = "idle";
+                            }
+                            st.tally[new_cam] = "program";
+                            st.active = new_cam as u32;
+                            confirmed_cam = new_cam;
+                            st.print_tally();
+                        }
+
+                        // Send tally_confirm datagram to client (spec §8.3).
+                        if let Some(fs) = flux_sink_weak.upgrade() {
+                            let confirm = TallyConfirm {
+                                msg_type: "tally_confirm".into(),
+                                channel: confirmed_cam as u8,
+                                state: "program".into(),
+                                color: PGM_COLOR.into(),
+                                label: format!("PGM CAM {}", confirmed_cam + 1),
+                            };
+                            let dg = confirm.encode_datagram(now_ns());
+                            fs.send_datagram(dg);
+                            log!(
+                                "[router] cut committed → CAM {} | tally_confirm sent",
+                                confirmed_cam + 1
+                            );
+                        }
+
+                        // Push the incoming IDR immediately (active is now new_cam).
+                        // Set DISCONT both in the GstBuffer flags (for in-process
+                        // elements) and in byte 1 of the FLUX header (FLAGS field,
+                        // bit 2 = DISCONT) so the client can distinguish this
+                        // switch-IDR from a normal periodic keyframe.
+                        let mut out_buf = incoming_buf.copy();
+                        {
+                            let ob = out_buf.get_mut().unwrap();
+                            ob.set_flags(gst::BufferFlags::DISCONT);
+                            // Patch FLUX FLAGS byte (byte 1) in-band.
+                            let mut map = ob.map_writable().unwrap();
+                            if map.len() > 1 {
+                                map[1] |= flux_flags::DISCONT;
+                            }
+                        }
+                        let _ = router_src.push_buffer(out_buf);
+                        diag_pushed += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Push a frame from the active camera.  During a pending switch we
+        // continue forwarding ALL active-camera frames (both IDRs and delta
+        // frames) so the client decoder never stalls and vtdec_hw's async
+        // pipeline stays busy — its 16 in-flight frames drain naturally as they
+        // complete.  The silence_ok gate above ensures the DISCONT switch-IDR
+        // is only committed once that pipeline is empty.
+        if let Some(ref sample) = active_sample {
             let buf = match sample.buffer() {
                 Some(b) => b,
                 None => continue,
             };
 
-            let is_keyframe = !buf.flags().contains(gst::BufferFlags::DELTA_UNIT);
-
-            // Commit a pending switch on the next keyframe from the incoming camera.
-            if pending_switch.load(Ordering::Acquire) && is_keyframe {
-                let new_cam = pending_channel.load(Ordering::Acquire) as usize;
-                pending_switch.store(false, Ordering::Release);
-
-                // Commit the switch.
-                let confirmed_cam;
-                {
-                    let mut st = state.lock().unwrap();
-                    // Mark old cam idle, new cam program.
-                    for i in 0..N {
-                        st.tally[i] = "idle";
-                    }
-                    st.tally[new_cam] = "program";
-                    st.active = new_cam as u32;
-                    confirmed_cam = new_cam;
-                    st.print_tally();
-                }
-
-                // Send tally_confirm datagram to client (spec §8.3).
-                if let Some(fs) = flux_sink_weak.upgrade() {
-                    let confirm = TallyConfirm {
-                        msg_type: "tally_confirm".into(),
-                        channel: confirmed_cam as u8,
-                        state: "program".into(),
-                        color: PGM_COLOR.into(),
-                        label: format!("PGM CAM {}", confirmed_cam + 1),
-                    };
-                    let dg = confirm.encode_datagram(now_ns());
-                    fs.send_datagram(dg);
-                    log!(
-                        "[router] cut committed → CAM {} | tally_confirm sent",
-                        confirmed_cam + 1
-                    );
-                }
-
-                // If we switched away from active, pull from the new camera next tick.
-                if confirmed_cam != active {
-                    continue;
-                }
-            }
-
-            // Push the buffer from the active camera.
-            let mut out_buf = buf.copy();
-            {
-                // Force DISCONT on keyframes so downstream decoder resyncs cleanly.
-                if is_keyframe {
-                    let ob = out_buf.get_mut().unwrap();
-                    ob.set_flags(gst::BufferFlags::DISCONT);
-                }
-            }
+            let out_buf = buf.copy();
             let _ = router_src.push_buffer(out_buf);
-        }
-
-        // Small sleep when no samples are ready — avoids 100% CPU spin.
-        let any_ready = samples.iter().any(|s| s.is_some());
-        if !any_ready {
+            diag_pushed += 1;
+        } else {
+            // No sample ready on active camera — brief sleep to avoid spinning.
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -538,6 +634,7 @@ fn run_control_task(
     pending_channel: Arc<AtomicU32>,
     state: Arc<Mutex<SwitcherState>>,
     _flux_sink_weak: gst::glib::WeakRef<gstfluxsink::FluxSink>,
+    cam_sinks: Arc<Vec<gst_app::AppSink>>,
 ) {
     use flux_framing::ControlType;
 
@@ -551,7 +648,13 @@ fn run_control_task(
                         if let Some(ref target) = cmd.target_id {
                             if let Some(n) = parse_cam_target(target) {
                                 log!("[control] FLUX-C routing → CAM {}", n + 1);
-                                request_switch(n, &pending_switch, &pending_channel, &state);
+                                request_switch(
+                                    n,
+                                    &pending_switch,
+                                    &pending_channel,
+                                    &state,
+                                    &cam_sinks,
+                                );
                             }
                         }
                     }
@@ -571,11 +674,14 @@ fn run_control_task(
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Queue a camera switch. The router thread will commit it on the next IDR.
+/// To minimise cut latency, we immediately signal the incoming camera's encoder
+/// to produce an IDR on its very next frame via an UpstreamForceKeyUnit event.
 fn request_switch(
     cam: usize,
     pending_switch: &Arc<AtomicBool>,
     pending_channel: &Arc<AtomicU32>,
     state: &Arc<Mutex<SwitcherState>>,
+    cam_sinks: &Arc<Vec<gst_app::AppSink>>,
 ) {
     let active = state.lock().unwrap().active as usize;
     if cam == active {
@@ -589,7 +695,18 @@ fn request_switch(
         let mut st = state.lock().unwrap();
         st.tally[cam] = "preview";
     }
-    log!("[switcher] Cut queued → CAM {} (waiting for IDR)", cam + 1);
+
+    // Force the incoming camera's encoder to emit an IDR immediately.
+    // Without this, the router would spin waiting for the next natural IDR
+    // (up to one GOP away), and frames from both cameras would be seen by
+    // the decoder while it waits — producing dissolve-style encoding errors.
+    let fku = gst_video::UpstreamForceKeyUnitEvent::builder()
+        .all_headers(true)
+        .build();
+    let sink_pad = cam_sinks[cam].static_pad("sink").unwrap();
+    sink_pad.push_event(fku);
+
+    log!("[switcher] Cut queued → CAM {} (IDR requested)", cam + 1);
 }
 
 /// Parse "cam-N" (1-indexed) → 0-indexed index.
@@ -610,11 +727,12 @@ fn handle_key(
     state: &Arc<Mutex<SwitcherState>>,
     pending_switch: &Arc<AtomicBool>,
     pending_channel: &Arc<AtomicU32>,
+    cam_sinks: &Arc<Vec<gst_app::AppSink>>,
 ) {
     match ch {
         '1'..='4' => {
             let cam = ch as usize - '1' as usize;
-            request_switch(cam, pending_switch, pending_channel, state);
+            request_switch(cam, pending_switch, pending_channel, state, cam_sinks);
         }
         'T' | 't' => {
             state.lock().unwrap().print_tally();

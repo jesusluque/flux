@@ -171,6 +171,19 @@ mod imp {
     }
 
     impl ObjectImpl for FluxSink {
+        fn constructed(&self) {
+            self.parent_constructed();
+            // fluxsink is a live network sink — it must not clock-synchronise
+            // buffers.  Without sync=false, BaseSink waits for the pipeline
+            // clock to reach each buffer's PTS; because the output pipeline
+            // has no shared clock with the encode pipelines, the clock never
+            // catches up and render() is never called after the first preroll.
+            use gst_base::prelude::BaseSinkExt;
+            self.obj()
+                .upcast_ref::<gst_base::BaseSink>()
+                .set_sync(false);
+        }
+
         fn properties() -> &'static [glib::ParamSpec] {
             static PROPS: std::sync::OnceLock<Vec<glib::ParamSpec>> = std::sync::OnceLock::new();
             PROPS.get_or_init(|| {

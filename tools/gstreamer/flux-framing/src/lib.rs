@@ -86,7 +86,11 @@ pub mod flags {
     pub const DROP_ELIGIBLE: u8 = 1 << 5;
     pub const EMBED_ASSOC: u8 = 1 << 4;
     pub const MONITOR_COPY: u8 = 1 << 3;
-    pub const SYNC_MASTER: u8 = 1 << 2;
+    /// Repurposed from SYNC_MASTER for PoC004: marks that this frame is a
+    /// discontinuity — the reference picture chain from the previous frame is
+    /// broken (e.g. after a camera switch).  The client must flush its decoder
+    /// before submitting this IDR.  Regular periodic IDRs do NOT set this bit.
+    pub const DISCONT: u8 = 1 << 2;
     pub const LAST_IN_GOP: u8 = 1 << 1;
     pub const HAS_METADATA: u8 = 1 << 0;
 }
@@ -287,6 +291,12 @@ impl FluxHeader {
 
     pub fn is_keyframe(&self) -> bool {
         self.flags & flags::KEYFRAME != 0
+    }
+    /// Returns true if this frame carries the DISCONT flag, meaning the
+    /// reference picture chain from the previous frame is broken (e.g. after
+    /// a camera switch).  Regular periodic IDRs do NOT set this flag.
+    pub fn is_discont(&self) -> bool {
+        self.flags & flags::DISCONT != 0
     }
     pub fn has_metadata(&self) -> bool {
         self.flags & flags::HAS_METADATA != 0

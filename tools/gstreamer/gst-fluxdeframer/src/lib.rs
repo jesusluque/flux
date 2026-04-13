@@ -295,11 +295,32 @@ mod imp {
 
             let hdr = match FluxHeader::decode(data) {
                 Some(h) if h.version == FLUX_VERSION => h,
-                _ => return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED),
+                Some(h) => {
+                    gst::warning!(
+                        cat(),
+                        "[fluxdeframer] DROP: version mismatch got={} expected={}",
+                        h.version,
+                        FLUX_VERSION
+                    );
+                    return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+                }
+                None => {
+                    gst::warning!(
+                        cat(),
+                        "[fluxdeframer] DROP: FluxHeader::decode failed len={}",
+                        data.len()
+                    );
+                    return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
+                }
             };
 
             // Non-media frames are discarded (keepalive etc. handled upstream)
             if hdr.frame_type != FrameType::MediaData {
+                gst::warning!(
+                    cat(),
+                    "[fluxdeframer] DROP: frame_type={:?} not MediaData",
+                    hdr.frame_type
+                );
                 return Ok(gst_base::BASE_TRANSFORM_FLOW_DROPPED);
             }
 
@@ -516,9 +537,9 @@ mod imp {
                 if !hdr.is_keyframe() {
                     outbuf_ref.set_flags(gst::BufferFlags::DELTA_UNIT);
                 }
-                // Fix 2: Forward DISCONT from the upstream source buffer so that
-                // h265parse and vtdec_hw know the reference picture chain is
-                // broken and reset their internal state accordingly.
+                // Set DISCONT on switch-IDRs so GstVideoDecoder (vtdec_hw base
+                // class) recognises this as the start of a new decode unit after
+                // the FlushStart/FlushStop pair sent just below.
                 if discont {
                     outbuf_ref.set_flags(gst::BufferFlags::DISCONT);
                 }
@@ -526,6 +547,15 @@ mod imp {
                     .map_writable()
                     .map_err(|_| gst::FlowError::Error)?;
                 map.copy_from_slice(&payload);
+            }
+
+            if discont {
+                // Switch-IDR: log for diagnostics.  GstBuffer::DISCONT is already
+                // set on the output buffer (above).  The downstream pipeline
+                // (h265parse → vtdec_hw) handles the SPS/PPS change via the
+                // DISCONT flag; vtdec_hw's Segment-event probe in the client
+                // suppresses spurious re-initialisation resets.
+                gst::debug!(cat(), "[fluxdeframer] DISCONT switch-IDR: pts={}", ts,);
             }
 
             Ok(GenerateOutputSuccess::Buffer(outbuf))
